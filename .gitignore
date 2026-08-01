@@ -1,0 +1,29 @@
+# Python caches and bytecode
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# Secrets / local environment
+.env
+.env.*
+
+# macOS
+.DS_Store
+
+# Large or private artifacts — never commit
+*.pdf
+*.zip
+*.sqlite
+*.sqlite3
+*.db
+
+# MinerU temporary artifacts (extracted full.zip content, batch responses)
+images/
+*.json
+
+# Local process logs — never commit
+PROGRESS.md
+BLOCKED.md
