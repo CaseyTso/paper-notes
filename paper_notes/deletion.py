@@ -42,10 +42,20 @@ Execution is one all-or-nothing transaction on the same filesystem:
    is preserved untouched at a named
    ``.paper-notes/recovery/<operation>/`` location and the staged
    deletion rolls back completely (hook zero times);
+6.5 every deleted path is re-checked right after the clean verdict and
+   before the hook: a racer reappearing in that window is the same
+   explicit conflict (hook zero times, item restored byte-for-byte,
+   racer preserved). The recovery area is resolved with lstat boundary
+   checks on every path component (never through a symlink, never
+   outside the vault) and existing recovery material is never
+   overwritten, deleted or rewritten — a racer colliding with
+   pre-seeded recovery material is preserved at a fresh in-vault
+   location instead;
 7. the rebuild hook fires exactly once, and only when the commit
    verdict is clean, so every rollback path fires the hook zero times;
-8. the transaction is then finalized (the recovery material is
-   discarded and the staged operation finished).
+8. the transaction is then finalized — only a real in-vault staging
+   directory is removed (boundary re-check, never through a symlink) —
+   and the staged operation finished.
 
 On any failure the staged operation is rolled back, any removed
 directories are recreated with their recorded modes, and the restored
@@ -621,25 +631,178 @@ def _commit_verdict(op: fsops.StagedOperation) -> list[Path]:
     return fsops.commit(proxy)
 
 
+def _real_dir_chain(p: Path, vault: Path) -> bool:
+    """True when every existing component from ``vault`` down to ``p``
+    is a real (lstat) directory.
+
+    Symlinks and non-directories anywhere in the chain fail closed —
+    the path is never resolved through them. Missing components below
+    an existing real directory are fine (they are created one level at
+    a time and re-verified by :func:`_ensure_real_dir_chain`)."""
+    cur = p
+    while True:
+        if cur == vault:
+            return True
+        if cur == cur.parent:  # filesystem root, still not the vault
+            return False
+        try:
+            st = cur.lstat()
+        except FileNotFoundError:
+            cur = cur.parent
+            continue
+        except OSError:
+            return False
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            return False
+        cur = cur.parent
+
+
+def _ensure_real_dir_chain(p: Path, vault: Path) -> Path | None:
+    """Ensure ``p`` is a real directory inside the vault, creating
+    missing components one level at a time.
+
+    Every existing component is lstat-verified (never a symlink, never
+    a non-directory) and every created component is re-verified right
+    after creation, so a symlink planted at any depth can neither
+    redirect the subsequent write outside the vault nor be silently
+    followed. Returns ``p`` when the whole chain is real, else None."""
+    existing = p
+    missing: list[Path] = []
+    while True:
+        if existing == vault:
+            break
+        if existing == existing.parent:
+            return None  # outside the vault
+        try:
+            existing.lstat()
+        except FileNotFoundError:
+            missing.append(existing)
+            existing = existing.parent
+            continue
+        except OSError:
+            return None
+        break
+    if not _real_dir_chain(existing, vault):
+        return None
+    for comp in reversed(missing):
+        try:
+            os.mkdir(comp)
+        except FileExistsError:
+            pass  # appeared between the check and the create: re-verify
+        except OSError:
+            return None
+        try:
+            st = comp.lstat()
+        except OSError:
+            return None
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            return None
+    return p
+
+
+def _recovery_dest(op: fsops.StagedOperation, rel: Path) -> Path:
+    """Boundary-checked, no-replace recovery destination inside the vault.
+
+    Tries the nominal ``.paper-notes/recovery/<operation>/<rel>`` and,
+    when any existing component of that path is a symlink or a
+    non-directory (vault escape) or the destination itself already
+    exists (pre-seeded recovery material that must never be
+    overwritten, deleted or rewritten), falls back to fresh real
+    directories under the recovery area (then directly under
+    ``.paper-notes``). The racer is therefore always preserved inside
+    the vault and the outside directory receives zero writes; the
+    destination is re-verified right before it is used."""
+    vault = op.vault_root
+    base = vault / LOCK_DIR / _RECOVERY_SUBDIR
+    candidates: list[Path] = [base / op.operation_id]
+    candidates += [
+        base / f"{op.operation_id}.recovery-{i}" for i in range(1, 65)
+    ]
+    candidates += [
+        vault / LOCK_DIR / f"{op.operation_id}.recovery-{i}" for i in range(1, 65)
+    ]
+    for root in candidates:
+        dest = root / rel
+        if dest.exists() or dest.is_symlink():
+            continue  # never replace existing recovery material
+        if _ensure_real_dir_chain(dest.parent, vault) is None:
+            continue  # symlink / non-directory in the chain: never follow
+        if dest.exists() or dest.is_symlink():
+            continue  # re-verify immediately before use
+        return dest
+    raise ItemConflict(
+        "concurrent change detected while deleting item: the recovery "
+        "area cannot be secured, so the racer was left in place"
+    )
+
+
+def _reappeared_targets(
+    op: fsops.StagedOperation,
+    plan: DeletePlan,
+    item_dir: Path,
+    work_dir: Path,
+) -> list[Path]:
+    """Every deleted path that exists again after the commit verdict.
+
+    The deletion removed every staged file target, every subtree
+    directory (deepest-first, the work directory itself included);
+    anything that reappeared at one of those paths after the verdict is
+    an external racer that must be preserved and reported — never
+    adopted, never deleted, and never silently left behind in a
+    ``deleted`` result."""
+    conflicts: list[Path] = []
+    for target in sorted(op.targets, key=str):
+        if target.exists() or target.is_symlink():
+            conflicts.append(target)
+    for state in plan.subtree:
+        if state.type != "dir":
+            continue
+        p = work_dir / state.path.relative_to(item_dir)
+        if p.exists() or p.is_symlink():
+            conflicts.append(p)
+    return sorted(set(conflicts), key=str)
+
+
+def _remove_staging(op: fsops.StagedOperation) -> None:
+    """Finalize the staging directory only when it is a real directory
+    inside the vault (lstat boundary re-check, never through a
+    symlink): a symlink planted at the staging path can neither make
+    the finalize delete anything outside the vault nor make us write
+    outside it. A compromised staging path is simply left untouched."""
+    if _real_dir_chain(op.directory, op.vault_root):
+        shutil.rmtree(op.directory, ignore_errors=True)
+
+
 def _preserve_racers(
     op: fsops.StagedOperation, conflicts: list[Path], work_dir: Path
 ) -> list[tuple[Path, Path]]:
     """Move every external racer that reappeared at a deleted path to a
-    named recovery location (``.paper-notes/recovery/<operation>/``,
-    same filesystem, atomic no-replace) so the staged deletion can roll
-    back to the exact pre-delete item while the racer survives
+    named recovery location (``.paper-notes/recovery/<operation>/`` by
+    default, same filesystem, atomic no-replace) so the staged deletion
+    can roll back to the exact pre-delete item while the racer survives
     untouched with its exact bytes. Returns ``(racer_path, recovery)``
     pairs that the conflict message reports explicitly — the racer is
     never overwritten, deleted, or silently adopted as the deletion
     baseline.
-    """
-    recovery_root = op.vault_root / LOCK_DIR / _RECOVERY_SUBDIR / op.operation_id
+
+    The destination is resolved with lstat boundary checks on every
+    path component (never through a symlink, never outside the vault)
+    and with no-replace semantics: existing recovery material is never
+    overwritten, deleted or rewritten — a colliding racer is preserved
+    at a fresh in-vault location instead (reported). Racer directories
+    are moved whole; racer files are preserved deepest-first so a file
+    keeps its flat named recovery path even when a containing directory
+    reappeared too."""
     recovered: list[tuple[Path, Path]] = []
-    for target in sorted(conflicts, key=str):
+    for target in sorted(
+        conflicts, key=lambda p: (len(p.parts), str(p)), reverse=True
+    ):
         if not target.exists() and not target.is_symlink():
-            continue  # vanished again; nothing to preserve
-        dest = recovery_root / target.relative_to(work_dir)
-        dest.parent.mkdir(parents=True, exist_ok=True)
+            continue  # vanished again (moved with a preserved directory)
+        rel = (
+            Path(work_dir.name) if target == work_dir else target.relative_to(work_dir)
+        )
+        dest = _recovery_dest(op, rel)
         os.replace(target, dest)
         recovered.append((target, dest))
     return recovered
@@ -715,27 +878,41 @@ def _execute(root: Path, plan: DeletePlan, hook: Callable[[], None]) -> None:
         #    location; the canonical item is restored byte-for-byte and
         #    the rebuild hook never fires.
         verdict_conflicts = _commit_verdict(op)
-        if verdict_conflicts:
-            recovered = _preserve_racers(op, verdict_conflicts, work_dir)
+
+        # 6.5 post-verdict re-check: a racer reappearing at any deleted
+        #     path AFTER the clean verdict but BEFORE the hook is the
+        #     same commit conflict — preserved, reported, rolled back,
+        #     hook zero times (the deletion is never reported 'deleted'
+        #     with a racer left behind in the work directory)
+        conflicts = sorted(
+            set(verdict_conflicts)
+            | set(_reappeared_targets(op, plan, item_dir, work_dir)),
+            key=str,
+        )
+        if conflicts:
+            recovered = _preserve_racers(op, conflicts, work_dir)
             if recovered:
                 detail = "; ".join(
                     f"{path} reappeared (racer preserved at {dest})"
                     for path, dest in recovered
                 )
             else:
-                detail = ", ".join(str(path) for path in verdict_conflicts)
+                detail = ", ".join(str(path) for path in conflicts)
             raise ItemConflict(
                 "concurrent change detected while deleting item: " + detail
             )
 
         # 7. rebuild hook exactly once — only after the commit verdict
-        #    came back clean, so every rollback path fires it zero times
+        #    came back clean and no racer reappeared at a deleted path,
+        #    so every rollback path fires it zero times
         hook()
 
         # 8. finalize the transaction (the verdict ran against a proxy,
-        #    so the recovery material is discarded here): the staged
-        #    operation is finished and nothing is restored any more
-        shutil.rmtree(op.directory, ignore_errors=True)
+        #    so the recovery material is discarded here): only a real
+        #    in-vault staging directory is removed (boundary re-check)
+        #    and the staged operation is finished — nothing is restored
+        #    any more
+        _remove_staging(op)
         op._finished = True
         committed = True
     except fsops.OperationConflict:

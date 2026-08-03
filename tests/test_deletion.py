@@ -32,6 +32,20 @@ Contract (spec §8.3 + plan Task 14 + manager approval):
   directory), releases the lock, and preserves the racer untouched at
   a named .paper-notes/recovery/ location (never overwritten, deleted
   or silently adopted as the deletion baseline).
+- Repair-R2 frozen regressions (each verified red before the fix):
+  (a) post-verdict TOCTOU: a racer reappearing at a staged hidden work
+  target after the clean commit verdict but before the rebuild hook is
+  an explicit ItemConflict that fires the hook zero times, restores the
+  item byte-for-byte, and preserves the racer at a named recovery
+  location (never reported 'deleted' with the racer left behind);
+  (b) recovery no-replace: recovery material that already exists at
+  the destination is never overwritten, deleted or rewritten — the new
+  racer is preserved at a fresh in-vault location instead;
+  (c) vault escape: a symlink planted at
+  .paper-notes/recovery/<operation>/ pointing at an outside directory
+  can never redirect the racer out of the vault — the outside
+  directory receives zero writes, the racer stays inside the vault, and
+  the planted symlink is left untouched.
 - Error messages and CLI JSON never leak the confirmation original
   text or underlying exceptions.
 """
@@ -811,6 +825,192 @@ class CommitConflictTest(unittest.TestCase):
             racer_backup = op_dirs[0] / f"{OLD}.md"
             self.assertEqual(racer_backup.read_bytes(), racer_content)
             self.assertNotEqual(racer_backup.read_bytes(), original_note)
+
+
+# ---------------------------------------------------------------------------
+# Repair-R2 frozen regressions: post-verdict race, recovery no-replace,
+# recovery vault escape
+# ---------------------------------------------------------------------------
+
+
+class PostVerdictRaceTest(unittest.TestCase):
+    """Frozen repair-R2 regression: a racer that reappears at a staged
+    hidden work target AFTER the clean commit verdict but BEFORE the
+    rebuild hook must be an explicit conflict — the hook never fires,
+    the canonical item is restored byte-for-byte, the racer survives at
+    a named recovery location, and the result is never reported as
+    'deleted' with the racer left behind in the work directory."""
+
+    def test_racer_after_clean_verdict_conflicts_and_restores(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            make_vault(root)
+            before = vault_manifest(root)
+            original_note = note(root, OLD).read_bytes()
+            hook = mock.Mock()
+            work = workdir(root)
+            racer_content = b"post-verdict racer at a staged hidden work target"
+            real_verdict = deletion._commit_verdict
+
+            def post_verdict_racer(op):
+                verdict = real_verdict(op)  # clean
+                self.assertEqual(verdict, [])
+                target = next(
+                    t
+                    for t in op.targets
+                    if work in t.parents and t.name == f"{OLD}.md"
+                )
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(racer_content)
+                return verdict
+
+            with mock.patch(
+                "paper_notes.deletion._commit_verdict", side_effect=post_verdict_racer
+            ):
+                with self.assertRaises(items.ItemConflict) as ctx:
+                    confirm(root, get_token(root), hook=hook)
+
+            # explicit conflict, never a silent 'deleted'
+            self.assertIn(f"{OLD}.md", str(ctx.exception))
+            hook.assert_not_called()
+            self.assertEqual(vault_manifest(root), before)
+            self.assertEqual(note(root, OLD).read_bytes(), original_note)
+            self.assertFalse(workdir(root).exists())
+            self.assertFalse((root / ".paper-notes" / "write.lock").exists())
+            self.assertEqual(staging_residue(root), [])
+            # the racer survives untouched at the named recovery location
+            op_dirs = sorted((root / ".paper-notes" / "recovery").glob("*"))
+            self.assertEqual(len(op_dirs), 1)
+            racer_backup = op_dirs[0] / f"{OLD}.md"
+            self.assertEqual(racer_backup.read_bytes(), racer_content)
+            self.assertNotEqual(racer_backup.read_bytes(), original_note)
+
+
+class RecoveryNoReplaceTest(unittest.TestCase):
+    """Frozen repair-R2 regression: recovery material that already
+    exists at the destination is never overwritten, deleted or
+    rewritten — the new racer is preserved at a fresh in-vault
+    location instead, the pre-seeded bytes survive exactly, and the
+    item is restored."""
+
+    def test_preseeded_recovery_file_is_never_overwritten(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            make_vault(root)
+            before = vault_manifest(root)
+            original_note = note(root, OLD).read_bytes()
+            hook = mock.Mock()
+            work = workdir(root)
+            racer_content = b"external racer: reappeared at a deleted target"
+            seeded_content = b"pre-seeded recovery bytes: must survive untouched"
+            seeded_paths = []
+            real_commit = fsops.commit
+
+            def seed_then_racer(op):
+                target = next(
+                    t
+                    for t in op.targets
+                    if work in t.parents and t.name == f"{OLD}.md"
+                )
+                seeded = (
+                    root / ".paper-notes" / "recovery" / op.operation_id / f"{OLD}.md"
+                )
+                seeded.parent.mkdir(parents=True, exist_ok=True)
+                seeded.write_bytes(seeded_content)
+                seeded_paths.append(seeded)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(racer_content)
+                return real_commit(op)
+
+            with mock.patch(
+                "paper_notes.deletion.fsops.commit", side_effect=seed_then_racer
+            ):
+                with self.assertRaises(items.ItemConflict) as ctx:
+                    confirm(root, get_token(root), hook=hook)
+
+            self.assertIn(f"{OLD}.md", str(ctx.exception))
+            hook.assert_not_called()
+            self.assertEqual(vault_manifest(root), before)
+            self.assertEqual(note(root, OLD).read_bytes(), original_note)
+            self.assertFalse(workdir(root).exists())
+            self.assertFalse((root / ".paper-notes" / "write.lock").exists())
+            self.assertEqual(staging_residue(root), [])
+            # the pre-seeded recovery material is byte-identical
+            seeded = seeded_paths[0]
+            self.assertEqual(seeded.read_bytes(), seeded_content)
+            # the new racer was preserved at a DIFFERENT in-vault path
+            racer_paths = [
+                p
+                for p in (root / ".paper-notes" / "recovery").rglob("*")
+                if p.is_file() and p.read_bytes() == racer_content
+            ]
+            self.assertEqual(len(racer_paths), 1)
+            self.assertNotEqual(racer_paths[0], seeded)
+            self.assertTrue(racer_paths[0].resolve().is_relative_to(root.resolve()))
+
+
+class RecoveryEscapeTest(unittest.TestCase):
+    """Frozen repair-R2 regression: a symlink planted at
+    .paper-notes/recovery/<operation>/ pointing at an outside
+    directory must never redirect the racer out of the vault — the
+    racer is preserved inside the vault, the outside directory
+    receives zero writes, and the item is restored."""
+
+    def test_recovery_symlink_never_escapes_the_vault(self):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as outside:
+            root = Path(td)
+            make_vault(root)
+            before = vault_manifest(root)
+            original_note = note(root, OLD).read_bytes()
+            hook = mock.Mock()
+            work = workdir(root)
+            racer_content = b"external racer: must never leave the vault"
+            real_commit = fsops.commit
+
+            def symlink_then_racer(op):
+                recovery_root = root / ".paper-notes" / "recovery" / op.operation_id
+                recovery_root.parent.mkdir(parents=True, exist_ok=True)
+                recovery_root.symlink_to(Path(outside), target_is_directory=True)
+                target = next(
+                    t
+                    for t in op.targets
+                    if work in t.parents and t.name == f"{OLD}.md"
+                )
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(racer_content)
+                return real_commit(op)
+
+            with mock.patch(
+                "paper_notes.deletion.fsops.commit", side_effect=symlink_then_racer
+            ):
+                with self.assertRaises(items.ItemConflict) as ctx:
+                    confirm(root, get_token(root), hook=hook)
+
+            self.assertIn(f"{OLD}.md", str(ctx.exception))
+            hook.assert_not_called()
+            self.assertEqual(vault_manifest(root), before)
+            self.assertEqual(note(root, OLD).read_bytes(), original_note)
+            self.assertFalse(workdir(root).exists())
+            self.assertFalse((root / ".paper-notes" / "write.lock").exists())
+            self.assertEqual(staging_residue(root), [])
+            # the outside directory received zero writes
+            self.assertEqual(sorted(os.listdir(Path(outside))), [])
+            # the planted symlink is untouched
+            recovery_root = root / ".paper-notes" / "recovery"
+            symlinks = [p for p in recovery_root.iterdir() if p.is_symlink()]
+            self.assertEqual(len(symlinks), 1)
+            self.assertEqual(os.readlink(symlinks[0]), str(Path(outside)))
+            # the racer was preserved INSIDE the vault
+            racer_paths = []
+            for dirpath, dirnames, filenames in os.walk(
+                recovery_root, followlinks=False
+            ):
+                for f in filenames:
+                    p = Path(dirpath) / f
+                    if p.is_file() and p.read_bytes() == racer_content:
+                        racer_paths.append(p)
+            self.assertEqual(len(racer_paths), 1)
+            self.assertTrue(racer_paths[0].resolve().is_relative_to(root.resolve()))
 
 
 # ---------------------------------------------------------------------------
