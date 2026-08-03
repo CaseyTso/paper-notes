@@ -24,6 +24,14 @@ Contract (spec §8.3 + plan Task 14 + manager approval):
   directory, leaves the fresh index free of the key/aliases/paper_id,
   fires the rebuild hook exactly once, leaves every other vault
   byte/mode unchanged, and leaves no lock/staging/work residue.
+- Repair-R1 frozen regression: a commit conflict (an external racer
+  reappearing at a staged hidden work target right before the real
+  commit) is an explicit ItemConflict that fires the rebuild hook zero
+  times, restores every pre-delete original file with exact
+  bytes/mode/topology (the canonical item is complete, never a stub
+  directory), releases the lock, and preserves the racer untouched at
+  a named .paper-notes/recovery/ location (never overwritten, deleted
+  or silently adopted as the deletion baseline).
 - Error messages and CLI JSON never leak the confirmation original
   text or underlying exceptions.
 """
@@ -741,6 +749,68 @@ class RollbackTest(unittest.TestCase):
                 with self.assertRaises(items.ItemConflict):
                     confirm(root, get_token(root), hook=hook)
             self.assert_restored(root, before, hook)
+
+
+class CommitConflictTest(unittest.TestCase):
+    """Frozen repair-R1 regression: a commit conflict must never lose
+    the original files, must fire the rebuild hook zero times, must
+    restore the canonical item completely (no stub directory), and must
+    preserve the external racer untouched at a named recovery location.
+
+    A distinct external racer appears at a staged hidden work target
+    (the canonical main note) immediately before the real commit; the
+    staged deletion must then roll back completely while the racer
+    survives with its exact bytes at ``.paper-notes/recovery/<op>/``.
+    """
+
+    def test_commit_conflict_restores_item_and_preserves_racer(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            make_vault(root)
+            before = vault_manifest(root)
+            original_note = note(root, OLD).read_bytes()
+            hook = mock.Mock()
+            real_commit = fsops.commit
+            work = workdir(root)
+            racer_content = b"external racer: reappeared at a deleted target"
+
+            def racer_commit(op):
+                # create the racer at a staged hidden work target right
+                # before the real commit runs
+                target = next(
+                    t
+                    for t in op.targets
+                    if work in t.parents and t.name == f"{OLD}.md"
+                )
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(racer_content)
+                return real_commit(op)
+
+            with mock.patch(
+                "paper_notes.deletion.fsops.commit", side_effect=racer_commit
+            ):
+                with self.assertRaises(items.ItemConflict) as ctx:
+                    confirm(root, get_token(root), hook=hook)
+
+            # explicit conflict, not silent: the racer path is named
+            self.assertIn(f"{OLD}.md", str(ctx.exception))
+            # 1) the rebuild hook never fired on the failed commit
+            hook.assert_not_called()
+            # 2) every pre-delete original file is restored with exact
+            #    bytes, modes and topology; the canonical item is
+            #    complete, not a stub directory
+            self.assertEqual(vault_manifest(root), before)
+            self.assertEqual(note(root, OLD).read_bytes(), original_note)
+            self.assertFalse(workdir(root).exists())
+            self.assertFalse((root / ".paper-notes" / "write.lock").exists())
+            self.assertEqual(staging_residue(root), [])
+            # 3) the external racer survives untouched at the named
+            #    recovery location and was never adopted as the baseline
+            op_dirs = sorted((root / ".paper-notes" / "recovery").glob("*"))
+            self.assertEqual(len(op_dirs), 1)
+            racer_backup = op_dirs[0] / f"{OLD}.md"
+            self.assertEqual(racer_backup.read_bytes(), racer_content)
+            self.assertNotEqual(racer_backup.read_bytes(), original_note)
 
 
 # ---------------------------------------------------------------------------

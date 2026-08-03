@@ -35,14 +35,27 @@ Execution is one all-or-nothing transaction on the same filesystem:
    removed deepest-first, ending with the work directory itself;
 6. post-verify (fresh index: the key, its aliases and the paper_id no
    longer resolve, the canonical directory is gone) runs **before**
-   the rebuild hook, so every rollback path fires the hook zero times;
-   the hook fires exactly once on success; commit is last.
+   the commit verdict: the real ``fsops.commit`` conflict detection
+   runs against a proxy operation (shared targets, throwaway staging
+   directory), so the recovery material survives the verdict and a
+   racer that reappeared at a deleted path is a conflict — each racer
+   is preserved untouched at a named
+   ``.paper-notes/recovery/<operation>/`` location and the staged
+   deletion rolls back completely (hook zero times);
+7. the rebuild hook fires exactly once, and only when the commit
+   verdict is clean, so every rollback path fires the hook zero times;
+8. the transaction is then finalized (the recovery material is
+   discarded and the staged operation finished).
 
 On any failure the staged operation is rolled back, any removed
 directories are recreated with their recorded modes, and the restored
 item is moved back to the canonical path with no-replace semantics (a
 concurrent directory that appeared there is preserved in place and
-reported explicitly).
+reported explicitly). A commit conflict is a failure too: the racer
+never replaces the deletion baseline, never disappears, and is never
+silently written over — it is moved to a named recovery location whose
+path the conflict message reports, and the canonical item is restored
+byte-for-byte.
 
 The scanner reuses the parser-aware state machine from
 :mod:`paper_notes.citations`: fenced code blocks, inline code spans,
@@ -64,6 +77,7 @@ import hashlib
 import hmac
 import json
 import os
+import shutil
 import stat
 import uuid
 from dataclasses import dataclass
@@ -92,7 +106,7 @@ from .items import (
     _noop_rebuild,
     _resolve_record,
 )
-from .locking import release_lock
+from .locking import LOCK_DIR, release_lock
 from .paths import paper_directory
 from .repository import build_index
 
@@ -104,6 +118,8 @@ _STALE_TOKEN_MESSAGE = (
 )
 
 _WORK_SUFFIX = ".delete-work"
+
+_RECOVERY_SUBDIR = "recovery"
 
 
 # ---------------------------------------------------------------------------
@@ -426,7 +442,10 @@ def confirm_delete(
     equal the canonical current citation key char-for-char (aliases,
     case differences and surrounding whitespace are rejected as a user
     error, zero writes, hook 0). The rebuild hook fires exactly once on
-    success and zero times on preview/failure.
+    success and zero times on preview/failure; a commit conflict (an
+    external racer reappearing at a deleted path) fires it zero times,
+    restores the whole item byte-for-byte, and preserves the racer at a
+    named ``.paper-notes/recovery/`` location reported by the conflict.
     """
     root = Path(vault_root)
     hook = rebuild_hook or _noop_rebuild
@@ -538,7 +557,16 @@ def _abort(
     first) with their recorded modes before the staged files are
     restored into them. Nested rollback/restore failures are sanitized;
     a refused restore (racer at the original path) surfaces as its own
-    ItemConflict."""
+    ItemConflict.
+
+    A committed operation is never rolled back: commit already
+    finalized the deletion (the staged snapshots were consumed), so the
+    item stays deleted and any racer at a deleted path stays preserved
+    untouched — nothing is restored, and the caller's conflict is what
+    surfaces.
+    """
+    if committed:
+        return
     try:
         if phase == "work":
             for state in sorted(
@@ -566,6 +594,55 @@ def _abort(
         raise
     except Exception:
         raise ItemError("item deletion failed while rolling back") from None
+
+
+def _commit_verdict(op: fsops.StagedOperation) -> list[Path]:
+    """Run the real ``fsops.commit`` conflict verdict without losing the
+    recovery material.
+
+    ``fsops.commit`` both detects conflicts and destroys the staging
+    directory, so a conflict discovered there could never be rolled
+    back. The verdict therefore runs against a proxy operation that
+    shares the real targets (the commit only reads fingerprints from
+    them) but points at a throwaway staging directory that never
+    exists: the real staging snapshots stay intact, the conflict list
+    is authoritative (identical detection to a real commit), and the
+    staged deletion can still be rolled back completely. A clean
+    verdict is finalized by the caller (the recovery material is then
+    discarded); a conflicted verdict rolls back with every pre-delete
+    original file restored.
+    """
+    proxy = fsops.StagedOperation(
+        vault_root=op.vault_root,
+        operation_id=op.operation_id,
+        directory=op.directory.parent / f"{op.operation_id}.verdict",
+        targets=op.targets,
+    )
+    return fsops.commit(proxy)
+
+
+def _preserve_racers(
+    op: fsops.StagedOperation, conflicts: list[Path], work_dir: Path
+) -> list[tuple[Path, Path]]:
+    """Move every external racer that reappeared at a deleted path to a
+    named recovery location (``.paper-notes/recovery/<operation>/``,
+    same filesystem, atomic no-replace) so the staged deletion can roll
+    back to the exact pre-delete item while the racer survives
+    untouched with its exact bytes. Returns ``(racer_path, recovery)``
+    pairs that the conflict message reports explicitly — the racer is
+    never overwritten, deleted, or silently adopted as the deletion
+    baseline.
+    """
+    recovery_root = op.vault_root / LOCK_DIR / _RECOVERY_SUBDIR / op.operation_id
+    recovered: list[tuple[Path, Path]] = []
+    for target in sorted(conflicts, key=str):
+        if not target.exists() and not target.is_symlink():
+            continue  # vanished again; nothing to preserve
+        dest = recovery_root / target.relative_to(work_dir)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(target, dest)
+        recovered.append((target, dest))
+    return recovered
 
 
 def _execute(root: Path, plan: DeletePlan, hook: Callable[[], None]) -> None:
@@ -629,18 +706,38 @@ def _execute(root: Path, plan: DeletePlan, hook: Callable[[], None]) -> None:
         #    back with the hook never fired
         _post_verify(root, plan)
 
-        # 6. rebuild hook exactly once
+        # 6. commit verdict BEFORE the hook: the real fsops.commit
+        #    conflict detection runs against a proxy operation (shared
+        #    targets, throwaway staging), so the recovery material
+        #    survives the verdict and a conflicted deletion can still
+        #    be rolled back completely. A racer that reappeared at a
+        #    deleted path is preserved untouched at a named recovery
+        #    location; the canonical item is restored byte-for-byte and
+        #    the rebuild hook never fires.
+        verdict_conflicts = _commit_verdict(op)
+        if verdict_conflicts:
+            recovered = _preserve_racers(op, verdict_conflicts, work_dir)
+            if recovered:
+                detail = "; ".join(
+                    f"{path} reappeared (racer preserved at {dest})"
+                    for path, dest in recovered
+                )
+            else:
+                detail = ", ".join(str(path) for path in verdict_conflicts)
+            raise ItemConflict(
+                "concurrent change detected while deleting item: " + detail
+            )
+
+        # 7. rebuild hook exactly once — only after the commit verdict
+        #    came back clean, so every rollback path fires it zero times
         hook()
 
-        # 7. commit (last); the operation's targets are all absent, so
-        #    conflicts mean something reappeared at a deleted path
-        conflicts = fsops.commit(op)
+        # 8. finalize the transaction (the verdict ran against a proxy,
+        #    so the recovery material is discarded here): the staged
+        #    operation is finished and nothing is restored any more
+        shutil.rmtree(op.directory, ignore_errors=True)
+        op._finished = True
         committed = True
-        if conflicts:
-            raise ItemConflict(
-                "concurrent change detected while deleting item: "
-                + ", ".join(str(path) for path in conflicts)
-            )
     except fsops.OperationConflict:
         _abort(op, committed, phase, plan, item_dir, work_dir)
         raise ItemConflict("concurrent change detected while deleting item") from None
