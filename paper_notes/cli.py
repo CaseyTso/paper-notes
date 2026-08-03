@@ -14,7 +14,7 @@ import traceback
 from pathlib import Path
 from typing import Any, NoReturn
 
-from . import __version__, attachments, citations, items
+from . import __version__, attachments, citations, deletion, items
 from .identifiers import extract_identifiers, parse_arxiv, parse_doi, parse_pmcid, parse_pmid
 from .protocol import (
     EXIT_CONFLICT,
@@ -166,6 +166,30 @@ def build_parser(json_mode: bool) -> _JsonAwareArgumentParser:
         help="confirmation token from a previous rename-key dry-run",
     )
     rename_parser.set_defaults(func=_cmd_item_rename_key)
+
+    delete_parser = item_subparsers.add_parser(
+        "delete",
+        help="preview/confirm permanent deletion of a canonical item (transactional)",
+        json_mode=json_mode,
+    )
+    delete_parser.add_argument("--vault", required=True, help="vault root directory")
+    delete_parser.add_argument(
+        "--key", required=True, help="citation key or alias to delete"
+    )
+    delete_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="produce the impact plan and confirmation token without writing",
+    )
+    delete_parser.add_argument(
+        "--confirm-key",
+        help="exact canonical citation key confirming the deletion",
+    )
+    delete_parser.add_argument(
+        "--confirm-token",
+        help="confirmation token from a previous item delete dry-run",
+    )
+    delete_parser.set_defaults(func=_cmd_item_delete)
     return parser
 
 
@@ -176,7 +200,7 @@ def _cmd_version(args: argparse.Namespace) -> Envelope:
 def _cmd_item_root(args: argparse.Namespace) -> Envelope:
     raise UserError(
         "missing item subcommand: use create, show, update, attach-pdf, "
-        "reconcile, or rename-key"
+        "reconcile, rename-key, or delete"
     )
 
 
@@ -411,6 +435,73 @@ def _cmd_item_rename_key(args: argparse.Namespace) -> Envelope:
             "action": "rename_key",
             "confirmation_token": result.confirmation_token,
             "plan": result.plan,
+        }
+    )
+
+
+def _cmd_item_delete(args: argparse.Namespace) -> Envelope:
+    from .protocol import needs_confirmation
+
+    if args.dry_run:
+        if args.confirm_key or args.confirm_token:
+            raise UserError("cannot combine --dry-run with --confirm-key/--confirm-token")
+        result = _run_item(
+            lambda: deletion.preview_delete(Path(args.vault), key=args.key)
+        )
+        return needs_confirmation(
+            {
+                "action": "delete",
+                "citation_key": result.citation_key,
+                "paper_id": result.paper_id,
+                "requested_key": result.requested_key,
+                "resolved_as": result.resolved_as,
+                "file_count": result.file_count,
+                "total_bytes": result.total_bytes,
+                "occurrences": [
+                    {
+                        "path": str(o.path),
+                        "kind": o.kind,
+                        "line": o.line,
+                        "column": o.column,
+                    }
+                    for o in result.occurrences
+                ],
+                "warnings": list(result.warnings),
+                "confirmation_token": result.confirmation_token,
+                "plan": result.plan,
+            }
+        )
+    if not args.confirm_key or not args.confirm_token:
+        raise UserError(
+            "item delete requires --confirm-key and --confirm-token "
+            "(or --dry-run for a read-only preview)"
+        )
+    result = _run_item(
+        lambda: deletion.confirm_delete(
+            Path(args.vault),
+            key=args.key,
+            confirm_key=args.confirm_key,
+            confirm_token=args.confirm_token,
+        )
+    )
+    return success(
+        {
+            "action": "deleted",
+            "citation_key": result.citation_key,
+            "paper_id": result.paper_id,
+            "path": str(result.path),
+            "file_count": result.file_count,
+            "total_bytes": result.total_bytes,
+            "occurrences": [
+                {
+                    "path": str(o.path),
+                    "kind": o.kind,
+                    "line": o.line,
+                    "column": o.column,
+                }
+                for o in result.occurrences
+            ],
+            "warnings": list(result.warnings),
         }
     )
 
