@@ -10,7 +10,11 @@ Usage:
     echo "KEY1\\nKEY2\\nKEY3" | python get_citekey.py --batch [--db-path ...]
 
 Returns citation key as plain text on stdout, or exits with error.
-If the item has no citation key, falls back to generating one from metadata.
+Migration-compatibility mode: returns the existing Better BibTeX key.
+If the item has no citation key, a structured
+{"status": "requires_core_allocation"} result is printed instead — there
+is no title+year fallback generation. Unknown item keys are reported
+separately as {"status": "not_found"}.
 """
 
 import sqlite3
@@ -31,7 +35,14 @@ def _copy_db(db_path):
 
 
 def get_citekey(item_key, db_path=None):
-    """Query Zotero SQLite for the citation key of a single item."""
+    """Query Zotero SQLite for the citation key of a single item.
+
+    Migration-compatibility mode: returns the existing Better BibTeX
+    ``citationKey`` value, or ``None`` when the item has none (the item
+    requires core allocation/confirmation). Raises ``KeyError`` when the
+    item key does not exist in the library at all, so callers can tell
+    ``not_found`` apart from ``requires_core_allocation``.
+    """
     if db_path is None:
         db_path = os.path.expanduser("~/Zotero/zotero.sqlite")
     if not os.path.exists(db_path):
@@ -39,7 +50,13 @@ def get_citekey(item_key, db_path=None):
 
     tmp = _copy_db(db_path)
     try:
-        return _query_single(tmp, item_key)
+        conn = sqlite3.connect(f"file:{tmp}?mode=ro", uri=True)
+        try:
+            if not _item_exists(conn, item_key):
+                raise KeyError(item_key)
+            return _query_single_from_conn(conn, item_key)
+        finally:
+            conn.close()
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
@@ -47,7 +64,10 @@ def get_citekey(item_key, db_path=None):
 
 def get_citekeys_batch(item_keys, db_path=None):
     """Query multiple item keys in a single DB session.
-    Returns dict: {item_key: citation_key}"""
+
+    Returns {item_key: {"citation_key": str|None, "requires_allocation": bool,
+    "not_found": bool}} so the three states are never conflated.
+    """
     if db_path is None:
         db_path = os.path.expanduser("~/Zotero/zotero.sqlite")
     if not os.path.exists(db_path):
@@ -60,13 +80,31 @@ def get_citekeys_batch(item_keys, db_path=None):
 
         results = {}
         for key in item_keys:
+            if not _item_exists(conn, key):
+                results[key] = {
+                    "citation_key": None,
+                    "requires_allocation": False,
+                    "not_found": True,
+                }
+                continue
             ck = _query_single_from_conn(conn, key)
-            results[key] = ck
+            results[key] = {
+                "citation_key": ck,
+                "requires_allocation": ck is None,
+                "not_found": False,
+            }
         conn.close()
         return results
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
+
+
+def _item_exists(conn, item_key):
+    """True when an item with this key exists in the library."""
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM items WHERE key = ?", (item_key,))
+    return cur.fetchone()[0] > 0
 
 
 def _query_single(db_path, item_key):
@@ -82,7 +120,8 @@ def _query_single_from_conn(conn, item_key):
     """Query from an existing connection."""
     cur = conn.cursor()
 
-    # Try citationKey first
+    # citationKey only; no fallback generation. A missing key means the
+    # item requires core allocation/confirmation.
     cur.execute("""
         SELECT idv.value FROM items i
         JOIN itemData id ON i.itemID = id.itemID
@@ -93,38 +132,12 @@ def _query_single_from_conn(conn, item_key):
     row = cur.fetchone()
     if row and row[0]:
         return row[0]
-
-    # Fallback: generate from title + year
-    cur.execute("""
-        SELECT f.fieldName, idv.value FROM items i
-        JOIN itemData id ON i.itemID = id.itemID
-        JOIN fields f ON id.fieldID = f.fieldID
-        JOIN itemDataValues idv ON id.valueID = idv.valueID
-        WHERE i.key = ? AND f.fieldName IN ('title', 'date')
-    """, (item_key,))
-    meta = {}
-    for field, value in cur.fetchall():
-        meta[field] = value if value else ""
-
-    title = meta.get('title', 'unknown')
-    year = (meta.get('date', '0000') or '0000')[:4]
-    words = title.split()
-    key_words = []
-    skip = {'the', 'a', 'an', 'of', 'in', 'on', 'to', 'for', 'and', 'with'}
-    for w in words:
-        clean = ''.join(c for c in w if c.isalnum())
-        if clean and clean.lower() not in skip:
-            key_words.append(clean)
-        if len(key_words) >= 4:
-            break
-
-    if key_words:
-        return key_words[0].lower() + ''.join(w.capitalize() for w in key_words[1:]) + year
-    return f"unknown{year}"
+    return None
 
 
-def main():
+def main(argv=None):
     import argparse
+    import json
 
     parser = argparse.ArgumentParser(description="Get Zotero citation key")
     parser.add_argument("item_key", nargs="?", help="Zotero item key (e.g., M5X4HK96)")
@@ -132,20 +145,26 @@ def main():
     parser.add_argument("--batch", action="store_true",
                         help="Read item keys from stdin (one per line), output JSON map")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     try:
         if args.batch:
             keys = [line.strip() for line in sys.stdin if line.strip()]
             results = get_citekeys_batch(keys, args.db_path)
-            import json
             print(json.dumps(results, ensure_ascii=False))
         elif args.item_key:
             ckey = get_citekey(args.item_key, args.db_path)
-            print(ckey)
+            if ckey is None:
+                # item exists but has no BBT key: requires core allocation
+                print(json.dumps({"status": "requires_core_allocation"},
+                                 ensure_ascii=False))
+            else:
+                print(ckey)
         else:
             parser.print_help()
             sys.exit(1)
+    except KeyError:
+        print(json.dumps({"status": "not_found"}, ensure_ascii=False))
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)

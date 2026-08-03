@@ -1,0 +1,20 @@
+schema_version: 1
+paper_id: 123e4567-e89b-12d3-a456-426614174000
+citation_key: liuDeepLearningPreprint2025
+citation_key_aliases:
+  - liuDeepLearningPre2025
+item_type: preprint
+
+title: Deep learning for early lung nodule detection in CT screening
+authors:
+  - family: Liu
+    given: Wei
+publication_date: 2025-03
+year: 2025
+
+pdf_status: missing
+reading_status: reading
+metadata_sources: [arxiv]
+field_provenance:
+  title: arxiv
+  authors: arxiv
