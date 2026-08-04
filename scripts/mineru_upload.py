@@ -4,6 +4,7 @@ MinerU PDF-to-Markdown conversion via batch file upload API.
 
 Usage:
     python mineru_upload.py <pdf_path> <output_dir> [--token TOKEN]
+                            [--citation-key CITATION_KEY]
 
 Prerequisites:
     - MinerU API token (from https://mineru.net API管理页面)
@@ -13,11 +14,17 @@ Pipeline:
     1. POST /api/v4/file-urls/batch  → get upload URL + batch_id
     2. PUT PDF to OSS signed URL (NO Content-Type header!)
     3. Poll GET /api/v4/extract-results/batch/{batch_id}
-    4. Download full.zip, extract → save full.md
+    4. Download full.zip, extract → save cleaned note
 
 Output:
-    Saves full.md to <output_dir>/full.md
-    Returns batch_id and extracted file path
+    With --citation-key KEY the cleaned note is finalized as
+    `<output_dir>/minerUmd_<citation_key>.md` (v2 canonical layout,
+    beside `<citation_key>.pdf`); legacy callers without
+    --citation-key keep the historical `<output_dir>/full.md` name.
+    The output directory must never be a final `figures/` directory —
+    temporary MinerU images and extraction files may not become final
+    figure assets (only render_pdf_figure.py writes into `figures/`).
+    Returns batch_id and the extracted note path.
 """
 
 import requests
@@ -36,6 +43,31 @@ DEFAULT_TOKEN = os.environ.get(
 )
 
 API_BASE = "https://mineru.net/api/v4"
+
+
+def _final_md_name(citation_key):
+    """Canonical v2 final name for the cleaned MinerU note.
+
+    v2 layout: `minerUmd_<citation_key>.md` beside the canonical
+    `<citation_key>.pdf`; legacy callers (no --citation-key) keep the
+    historical `full.md` name.
+    """
+    return f"minerUmd_{citation_key}.md" if citation_key else "full.md"
+
+
+def _reject_figures_output_dir(output_dir):
+    """Refuse to write MinerU output into a final figures/ directory.
+
+    Temporary MinerU images and the extracted tree must never become
+    final <paper_dir>/figures/ assets; render_pdf_figure.py is the only
+    writer of final figure PNGs.
+    """
+    resolved = Path(output_dir).resolve()
+    if resolved.name == "figures":
+        raise ValueError(
+            f"refusing to write MinerU output into a final figures/ "
+            f"directory: {resolved} (temporary MinerU images must never "
+            "become final figure assets)")
 
 
 def upload_pdf(pdf_path, token, model="vlm", language="en"):
@@ -126,12 +158,19 @@ def _download_via_curl(url, dest_path, max_retries=3):
     return False
 
 
-def download_and_extract(full_zip_url, output_dir):
-    """Download result zip and extract full.md to output_dir.
+def download_and_extract(full_zip_url, output_dir, citation_key=None):
+    """Download result zip and extract the cleaned note to output_dir.
+
+    The note is finalized as `minerUmd_<citation_key>.md` when a
+    citation key is given, else as the legacy `full.md`. The output
+    directory must never be a final `figures/` directory (temporary
+    MinerU images must not become final figure assets) — enforced
+    before any file is created.
 
     Tries Python requests first; falls back to curl on SSL errors
     (Python's SSL library can have compatibility issues with certain CDNs).
     """
+    _reject_figures_output_dir(output_dir)
     zip_path = os.path.join(output_dir, "mineru_result.zip")
     extract_dir = os.path.join(output_dir, "mineru_extract")
     os.makedirs(extract_dir, exist_ok=True)
@@ -159,26 +198,28 @@ def download_and_extract(full_zip_url, output_dir):
 
     os.remove(zip_path)
 
-    # Find full.md
+    # Find full.md in the extracted tree
     for root, dirs, files in os.walk(extract_dir):
         for f in files:
             if f == 'full.md':
                 src = os.path.join(root, f)
-                dst = os.path.join(output_dir, "full.md")
+                dst = os.path.join(output_dir, _final_md_name(citation_key))
                 shutil.copy2(src, dst)
                 size = os.path.getsize(dst)
-                print(f"  full.md: {size} bytes", file=sys.stderr)
+                print(f"  {os.path.basename(dst)}: {size} bytes", file=sys.stderr)
                 return dst
 
     raise FileNotFoundError("full.md not found in MinerU zip output")
 
 
-def main():
+def main(argv=None):
     import argparse
 
     parser = argparse.ArgumentParser(description="Convert PDF to Markdown via MinerU")
     parser.add_argument("pdf_path", help="Path to PDF file")
-    parser.add_argument("output_dir", help="Directory to save full.md and temp files")
+    parser.add_argument("output_dir",
+                        help="Directory for the final note and MinerU temp "
+                             "files; never a final figures/ directory")
     parser.add_argument("--token", default=DEFAULT_TOKEN, help="MinerU API token")
     parser.add_argument("--model", default="vlm", help="Model version: pipeline|vlm")
     parser.add_argument("--language", default="en", help="Document language")
@@ -186,12 +227,22 @@ def main():
                         help="Max polling seconds (default: 1800)")
     parser.add_argument("--interval", type=int, default=10,
                         help="Poll interval seconds (default: 10)")
+    parser.add_argument("--citation-key", default=None,
+                        help="Citation key of the paper: finalize the "
+                             "cleaned note as minerUmd_<citation_key>.md "
+                             "(legacy default: full.md)")
     parser.add_argument("--download-only", default=None,
                         help="Skip upload & poll — just download from existing batch_id")
     parser.add_argument("--zip-url", default=None,
                         help="Direct zip URL for download (use with --download-only)")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    try:
+        _reject_figures_output_dir(args.output_dir)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -215,7 +266,7 @@ def main():
                 sys.exit(1)
             zip_url = extract[0].get("full_zip_url", "")
         print(f"Download-only mode: {zip_url[:80]}...", file=sys.stderr)
-        md_path = download_and_extract(zip_url, args.output_dir)
+        md_path = download_and_extract(zip_url, args.output_dir, args.citation_key)
         print(json.dumps({"full_md_path": md_path, "status": "success"}))
         return
 
@@ -234,7 +285,7 @@ def main():
     print(f"  Done: {zip_url[:80]}...", file=sys.stderr)
 
     print("Downloading and extracting...", file=sys.stderr)
-    md_path = download_and_extract(zip_url, args.output_dir)
+    md_path = download_and_extract(zip_url, args.output_dir, args.citation_key)
 
     # Output result as JSON for agent consumption
     print(json.dumps({

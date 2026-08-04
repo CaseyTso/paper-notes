@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Clean MinerU output markdown: migrate images into the vault attachment dir,
-remove HTML blocks and residual artifacts.
+Clean MinerU output markdown: migrate images into the paper attachment
+dir, remove HTML blocks and residual artifacts.
 
 Usage:
     python clean_md.py <input.md> [--in-place] [--output cleaned.md]
@@ -17,6 +17,11 @@ With --attachments-dir:
     fail the whole run with a non-zero exit and leave the markdown
     completely untouched (no partial rewrites). MinerU renders figures as
     plain relative markdown links — never base64.
+
+    The canonical destination is `<paper_dir>/attachments/` (v2 layout).
+    A final `figures/` directory is always refused: temporary MinerU
+    images must never become final figure assets — only
+    render_pdf_figure.py writes into `<paper_dir>/figures/`.
 
 Without --attachments-dir (legacy calls):
     `![](images/...)` embeds are removed exactly as before.
@@ -51,14 +56,24 @@ def migrate_images(content, md_path, attachments_dir):
     then copies all files, then rewrites the references to Obsidian
     embeds `![[<name>]]`. Position and document order are preserved.
     Returns the rewritten content.
+
+    A final `figures/` directory is always rejected: temporary MinerU
+    images must never become final figure assets (only
+    render_pdf_figure.py writes into `<paper_dir>/figures/`).
     """
+    attachments_dir = Path(attachments_dir)
+    if attachments_dir.resolve().name == "figures":
+        raise ImageMigrationError(
+            f"refusing to migrate MinerU images into a final figures/ "
+            f"directory: {attachments_dir} (temporary MinerU images must "
+            "never become final figure assets)")
+
     ref_re = re.compile(r'!\[[^\]]*\]\(images/([^)\s]+)\)')
     refs = list(ref_re.finditer(content))
     if not refs:
         return content
 
     md_dir = md_path.parent if md_path is not None else Path('.')
-    attachments_dir = Path(attachments_dir)
 
     # Phase 1: validate everything before touching anything (no writes,
     # not even creating the attachment dir, until validation passes).
@@ -144,8 +159,12 @@ def main():
     parser.add_argument("--output", default=None,
                         help="Output file (default: in-place or stdout)")
     parser.add_argument("--attachments-dir", default=None,
-                        help="Vault attachment dir (e.g. '<vault>/01 attachments'): "
-                             "migrate images/ references into it as Obsidian embeds")
+                        help="Destination dir for migrated MinerU images "
+                             "(v2 canonical: '<paper_dir>/attachments/'; "
+                             "legacy: '<vault>/01 attachments'): migrate "
+                             "images/ references into it as Obsidian "
+                             "embeds; a final figures/ directory is "
+                             "always refused")
 
     args = parser.parse_args()
 

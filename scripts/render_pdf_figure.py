@@ -2,13 +2,14 @@
 """
 Render a region of a PDF page to a high-resolution lossless PNG figure.
 
-Figures embedded in notes must come from the ORIGINAL Zotero PDF, never
-from low-resolution MinerU JPG fragments. This CLI renders a full figure
+Figures embedded in notes must come from the canonical/original-quality
+primary PDF (the per-paper `<citation_key>.pdf`), never from
+low-resolution MinerU JPG fragments. This CLI renders a full figure
 area (bbox, in PDF points, from the caption page) at >=300 dpi.
 
 Usage:
     python3 render_pdf_figure.py PDF --page 2 --bbox 39.7,45,561.5,576 \
-        --dpi 300 --output-dir "<paper_dir>/Figure_<paper_title>"
+        --dpi 300 --output-dir "<paper_dir>/figures"
 
 Semantics:
   - --page is 1-based; --bbox is x0,y0,x1,y1 in PDF points (top-left
@@ -122,7 +123,10 @@ def render_png(pdf_path, page_number, bbox_text, dpi, out_dir):
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Render a PDF page region to a 300dpi+ lossless PNG figure")
-    parser.add_argument("pdf", help="Path to the ORIGINAL Zotero PDF")
+    parser.add_argument(
+        "pdf",
+        help="Path to the canonical/original-quality primary PDF "
+             "(e.g. '<paper_dir>/<citation_key>.pdf')")
     parser.add_argument("--page", type=int, required=True,
                         help="1-based page number containing the figure")
     parser.add_argument("--bbox", required=True,
@@ -131,7 +135,8 @@ def main(argv=None):
                         help=f"Rendering resolution (>= {MIN_DPI}); default 300")
     parser.add_argument("--output-dir", required=True,
                         help="Destination directory "
-                             "(e.g. '<paper_dir>/Figure_<paper_title>')")
+                             "(v2 canonical: '<paper_dir>/figures/'; "
+                             "legacy: '<paper_dir>/Figure_<paper_title>')")
     args = parser.parse_args(argv)
 
     try:
