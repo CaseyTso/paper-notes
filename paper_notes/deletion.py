@@ -43,16 +43,29 @@ Execution is one all-or-nothing transaction on the same filesystem:
    ``.paper-notes/recovery/<operation>/`` location and the staged
    deletion rolls back completely (hook zero times);
 6.5 every deleted path is re-checked right after the clean verdict and
-   before the hook: a racer reappearing in that window is the same
-   explicit conflict (hook zero times, item restored byte-for-byte,
-   racer preserved). The recovery area is resolved with lstat boundary
-   checks on every path component (never through a symlink, never
-   outside the vault) and existing recovery material is never
-   overwritten, deleted or rewritten — a racer colliding with
+   before the participant's finalize seam: a racer reappearing in that
+   window is the same explicit conflict (hook zero times, item restored
+   byte-for-byte, racer preserved). The recovery area is resolved with
+   lstat boundary checks on every path component (never through a
+   symlink, never outside the vault) and existing recovery material is
+   never overwritten, deleted or rewritten — a racer colliding with
    pre-seeded recovery material is preserved at a fresh in-vault
    location instead;
-7. the rebuild hook fires exactly once, and only when the commit
-   verdict is clean, so every rollback path fires the hook zero times;
+6.75 index publication, the final authority and the success transition
+   are merged into the transaction participant (``IndexParticipant``):
+   the full expected-state authority runs again inside ``finalize`` —
+   a hidden work-target racer injected at the finalize seam is the
+   same explicit conflict with the hook zero times — then the legacy
+   rebuild hook fires exactly once INSIDE the transaction, then a
+   second full authority detects any edit/chmod/type swap the hook
+   performed on a transaction target and rolls the item AND both index
+   files back, and only then is the staging directory removed and the
+   operation finished (the deletion's linearization point: after the
+   last expected-state authority no writable callback runs);
+7. the rebuild hook fires exactly once, and only when every authority
+   is clean, so every rollback path fires the hook zero times (a
+   hook-time divergence fires it exactly once — the deletion itself is
+   never reported 'deleted');
 8. the transaction is then finalized — only a real in-vault staging
    directory is removed (boundary re-check, never through a symlink) —
    and the staged operation finished.
@@ -835,14 +848,39 @@ def _preserve_racers(
     return recovered
 
 
+def _raise_conflicts(
+    op: fsops.StagedOperation, conflicts: list[Path], work_dir: Path
+) -> None:
+    """Preserve every conflict racer and raise the explicit conflict.
+
+    Every racer that reappeared at a deleted path is moved to a named
+    in-vault recovery location (boundary-checked, never replaced,
+    never written outside the vault); the conflict message reports each
+    ``path -> recovery`` pair explicitly. A clean list returns without
+    raising, so this is safe to use as the single conflict exit of the
+    final authorities.
+    """
+    if not conflicts:
+        return
+    recovered = _preserve_racers(op, conflicts, work_dir)
+    if recovered:
+        detail = "; ".join(
+            f"{path} reappeared (racer preserved at {dest})"
+            for path, dest in recovered
+        )
+    else:
+        detail = ", ".join(str(path) for path in conflicts)
+    raise ItemConflict("concurrent change detected while deleting item: " + detail)
+
+
 def _final_conflicts(
     op: fsops.StagedOperation,
     plan: DeletePlan,
     item_dir: Path,
     work_dir: Path,
 ) -> list[Path]:
-    """Final authority before the rebuild hook: the complete
-    expected-state detection over the whole transaction.
+    """Final authority: the complete expected-state detection over the
+    whole transaction.
 
     Every staged target must still match its expected fingerprint —
     deleted paths must still be absent, both index writes must still be
@@ -850,8 +888,11 @@ def _final_conflicts(
     directory must still be absent. Anything else is an external racer
     (or an escape) that must be preserved and reported; the hook fires
     zero times and the whole transaction (item + both index files)
-    rolls back. This is the plain ``rebuild_hook`` success window: the
-    R2 ``_reappeared_targets`` clean check is gone.
+    rolls back. This is the plain ``rebuild_hook`` success window and
+    runs as the authority inside
+    :meth:`IndexParticipant.finalize` — before the legacy hook and
+    again right after it, so a racer appearing at either boundary (the
+    finalize seam or the hook's own write window) is detected.
     """
     conflicts = fsops.commit_detect(op)
     for state in plan.subtree:
@@ -875,11 +916,17 @@ class IndexParticipant:
     ``commit`` writes both new states as staged managed writes (each
     expected-state-guarded, so an external edit / chmod / type swap
     between the two outputs conflicts and rolls everything back);
-    ``finalize`` runs after the clean final authority and before the
-    rebuild hook — a failure there also rolls the item AND both index
-    files back to their exact bytes+mode with the hook zero times. The
-    real ``library.json`` / ``citation-aliases.json`` writer (Task 15)
-    plugs in behind this seam.
+    ``finalize`` is the merged final authority + legacy hook + success
+    transition: after the clean final authority the legacy rebuild
+    hook runs exactly once INSIDE the transaction, a second full
+    authority detects any edit/chmod/type swap the hook performed on a
+    transaction target, and only then is the staging directory removed
+    and the operation finished. A racer or hook divergence at any
+    point rolls the item AND both index files back to their exact
+    bytes+mode with the hook zero times (a hook-time divergence fires
+    it exactly once — the deletion itself is never reported
+    'deleted'). The real ``library.json`` / ``citation-aliases.json``
+    writer (Task 15) plugs in behind this seam.
     """
 
     def __init__(self, root: Path, plan: DeletePlan):
@@ -929,9 +976,62 @@ class IndexParticipant:
         fsops.write_target(self._op, self._lib, self._lib_new)
         fsops.write_target(self._op, self._aliases, self._aliases_new)
 
-    def finalize(self) -> None:
-        """Post-verdict publication window (Task 15 real-writer seam)."""
-        return None
+    def finalize(self, hook: Callable[[], None]) -> None:
+        """Merged final authority, legacy hook and success transition.
+
+        Runs after the item deletion, both index publications and the
+        clean commit verdict — the last phase of the transaction:
+
+        1. final authority #1 — the full expected-state detection
+           (every staged target still matches its expected fingerprint:
+           deleted paths absent, both index files exactly the managed
+           bytes+mode — plus every removed subtree directory still
+           absent). Any racer — including one injected at this
+           finalize seam, right after the pre-finalize authority
+           returned clean — is preserved at a named in-vault recovery
+           location and the whole transaction (item + both index
+           files) rolls back with the hook zero times;
+        2. the legacy rebuild hook runs exactly once, INSIDE the
+           transaction: any write it performs on a transaction target
+           is detected by the second authority, so the hook can never
+           silently corrupt the published indexes after the final
+           check;
+        3. final authority #2 — the same full detection again: an
+           external edit/chmod/type swap during the hook (or the
+           hook's own divergence from the managed new state) is a
+           structured conflict that rolls the item AND both index
+           files back with the racer preserved at a named recovery
+           location;
+        4. success transition — only when both authorities are clean
+           the staging directory is removed (boundary re-checked,
+           never through a symlink) and the operation finished. This
+           is the deletion's linearization point: after the last
+           expected-state authority no writable callback runs.
+        """
+        op = self._op
+        if op is None:
+            raise ItemError("participant was not prepared")
+        item_dir = paper_directory(self._root, self._plan.key)
+        work_dir = _work_directory(item_dir)
+        self._final_authority(op, item_dir, work_dir)
+        hook()
+        self._final_authority(op, item_dir, work_dir)
+        _remove_staging(op)
+        op._finished = True
+
+    def _final_authority(
+        self, op: fsops.StagedOperation, item_dir: Path, work_dir: Path
+    ) -> None:
+        """Full expected-state detection over the whole transaction.
+
+        A clean detection returns; any conflict preserves every racer
+        at a named in-vault recovery location and raises the explicit
+        :class:`~paper_notes.items.ItemConflict` (the caller rolls the
+        item and both index files back).
+        """
+        conflicts = _final_conflicts(op, self._plan, item_dir, work_dir)
+        if conflicts:
+            _raise_conflicts(op, conflicts, work_dir)
 
     def abort(self, op: fsops.StagedOperation) -> None:
         """Restore both index files before ``fsops.rollback`` consumes
@@ -1065,51 +1165,33 @@ def _execute(root: Path, plan: DeletePlan, hook: Callable[[], None]) -> None:
         #    the rebuild hook never fires.
         verdict_conflicts = _commit_verdict(op)
 
-        # 6.5 final authority: the plain rebuild_hook success window.
-        #     A racer reappearing at any deleted path — or any index
-        #     target no longer matching the managed bytes+mode — AFTER
-        #     the clean verdict but BEFORE the hook is the same commit
-        #     conflict: preserved, reported, rolled back, hook zero
-        #     times (the deletion is never reported 'deleted' with a
-        #     racer left behind in the work directory, and the item
-        #     deletion and both index files' new state are only visible
-        #     together)
+        # 6.5 final authority before the finalize seam: the plain
+        #     rebuild_hook success window. A racer reappearing at any
+        #     deleted path — or any index target no longer matching the
+        #     managed bytes+mode — AFTER the clean verdict but BEFORE
+        #     the finalize seam is the same commit conflict: preserved,
+        #     reported, rolled back, hook zero times (the deletion is
+        #     never reported 'deleted' with a racer left behind in the
+        #     work directory, and the item deletion and both index
+        #     files' new state are only visible together)
         conflicts = sorted(
             set(verdict_conflicts) | set(_final_conflicts(op, plan, item_dir, work_dir)),
             key=str,
         )
-        if conflicts:
-            recovered = _preserve_racers(op, conflicts, work_dir)
-            if recovered:
-                detail = "; ".join(
-                    f"{path} reappeared (racer preserved at {dest})"
-                    for path, dest in recovered
-                )
-            else:
-                detail = ", ".join(str(path) for path in conflicts)
-            raise ItemConflict(
-                "concurrent change detected while deleting item: " + detail
-            )
+        _raise_conflicts(op, conflicts, work_dir)
 
-        # 6.75 participant finalize: runs after the clean final
-        #     authority and before the rebuild hook — a failure here
-        #     rolls the item AND both index files back with the hook
-        #     zero times
-        participant.finalize()
-
-        # 7. rebuild hook exactly once — only after the commit verdict
-        #    came back clean, no racer reappeared at a deleted path and
-        #    the participant finalized, so every rollback path fires it
-        #    zero times
-        hook()
-
-        # 8. finalize the transaction (the verdict ran against a proxy,
-        #    so the recovery material is discarded here): only a real
-        #    in-vault staging directory is removed (boundary re-check)
-        #    and the staged operation is finished — nothing is restored
-        #    any more
-        _remove_staging(op)
-        op._finished = True
+        # 6.75 participant finalize: index publication, the final
+        #     authority and the success transition are merged into the
+        #     transaction participant. The legacy rebuild hook is only
+        #     a managed participant adapter invoked INSIDE the
+        #     transaction between two full expected-state authorities —
+        #     never an arbitrary writable callback after the final
+        #     check, so a hook-time edit/chmod/type swap of an index
+        #     file is detected and rolled back with the item. After
+        #     this returns the deletion is committed: the staging
+        #     directory is gone, the operation is finished and only
+        #     fail-free bookkeeping remains (the linearization point).
+        participant.finalize(hook)
         committed = True
     except fsops.OperationConflict:
         _abort(op, committed, phase, plan, item_dir, work_dir, participant)

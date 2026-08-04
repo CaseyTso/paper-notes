@@ -72,6 +72,27 @@ Contract (spec §8.3 + plan Task 14 + manager approval):
   _reappeared_targets clean check is gone — the final authority (a
   full expected-state detection) is the plain rebuild_hook success
   window.
+- Repair-R4 frozen regressions (Decision A continued, each verified red
+  before the fix): index publication, the final authority and the
+  success transition are merged into IndexParticipant.finalize(hook) —
+  the legacy rebuild hook is only a managed participant adapter invoked
+  INSIDE the transaction between two full expected-state authorities,
+  never an arbitrary writable callback after the final check:
+  (a) a hidden work-target racer injected at the IndexParticipant
+  finalize() seam (after the real _final_conflicts returned clean) is
+  an explicit ItemConflict: the hook never fires, the item and both
+  index files roll back to their exact bytes+mode, and the racer is
+  preserved untouched at a named in-vault recovery location with no
+  staging/work/temp/lock residue; (b) an external edit / chmod /
+  file<->dir/symlink swap of library.json or citation-aliases.json
+  performed by the successful rebuild_hook() (or during it) is
+  detected by the post-hook authority and rolls the item AND both
+  index files back, with the external bytes preserved at a named
+  recovery location — the deletion is never reported 'deleted' with
+  the external bytes as the final index; (c) the deletion's
+  linearization point is the success transition at the end of
+  finalize: after the last expected-state authority no writable
+  callback runs.
 """
 
 import contextlib
@@ -1117,9 +1138,9 @@ class TransactionSeamTest(unittest.TestCase):
                 commits.append(1)
                 return real_commit(self)
 
-            def counting_finalize(self):
+            def counting_finalize(self, hook):
                 finalizes.append(1)
-                return real_finalize(self)
+                return real_finalize(self, hook)
 
             with mock.patch.object(
                 deletion.IndexParticipant, "commit", counting_commit
@@ -1426,6 +1447,348 @@ class ParticipantFailureTest(unittest.TestCase):
             self.assertFalse(workdir(root).exists())
             self.assertFalse((root / ".paper-notes" / "write.lock").exists())
             self.assertEqual(staging_residue(root), [])
+
+
+class FinalAuthoritySeamTest(unittest.TestCase):
+    """Frozen repair-R4 regressions: the legacy rebuild hook is a
+    managed participant adapter invoked INSIDE
+    IndexParticipant.finalize(hook) between two full expected-state
+    authorities.
+
+    A hidden work-target racer injected at the finalize() seam (after
+    the real _final_conflicts returned clean) is an explicit
+    ItemConflict with the hook zero times; an edit / chmod /
+    file<->dir/symlink swap of library.json or citation-aliases.json
+    performed by the successful rebuild_hook() is detected by the
+    post-hook authority and rolls the item AND both index files back
+    with the external bytes preserved at a named recovery location —
+    the deletion is never reported 'deleted' with the external bytes
+    as the final index. The deletion's linearization point is the
+    success transition at the end of finalize: after the last
+    expected-state authority no writable callback runs.
+    """
+
+    def _scenario(self):
+        td = tempfile.TemporaryDirectory()
+        root = Path(td.name)
+        make_vault(root)
+        before = vault_manifest(root)
+        index_before = seed_index(root)
+        original_note = note(root, OLD).read_bytes()
+        hook = mock.Mock()
+        return td, root, before, index_before, original_note, hook
+
+    def _assert_racer_in_recovery(self, root, racer_bytes, count=1):
+        racer_paths = [
+            p
+            for p in (root / ".paper-notes" / "recovery").rglob("*")
+            if p.is_file() and p.read_bytes() == racer_bytes
+        ]
+        self.assertEqual(len(racer_paths), count)
+        for p in racer_paths:
+            self.assertTrue(p.resolve().is_relative_to(root.resolve()))
+
+    def test_racer_injected_at_finalize_seam_conflicts(self):
+        """Clean _final_conflicts 后、由 IndexParticipant.finalize() seam
+        注入 hidden work-target racer: no success / no hook publication;
+        item and both index files restored to their exact bytes+mode;
+        racer preserved untouched at a named in-vault recovery location;
+        no staging/work/temp/lock residue."""
+        td, root, before, index_before, original_note, hook = self._scenario()
+        with td:
+            work = workdir(root)
+            racer_content = b"racer injected at the IndexParticipant.finalize seam"
+            real_finalize = deletion.IndexParticipant.finalize
+
+            def finalize_with_racer(self, hook_):
+                # the real _final_conflicts already returned clean; the
+                # hidden work-target racer appears only inside the
+                # finalize seam, right before the real finalize runs
+                target = work / f"{OLD}.md"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(racer_content)
+                return real_finalize(self, hook_)
+
+            with mock.patch.object(
+                deletion.IndexParticipant, "finalize", finalize_with_racer
+            ):
+                with self.assertRaises(items.ItemConflict) as ctx:
+                    confirm(root, get_token(root), hook=hook)
+
+            self.assertIn(f"{OLD}.md", str(ctx.exception))
+            hook.assert_not_called()
+            self.assertEqual(vault_manifest(root), before)
+            self.assertEqual(note(root, OLD).read_bytes(), original_note)
+            assert_index_restored(self, root, index_before)
+            self.assertFalse(workdir(root).exists())
+            self.assertFalse((root / ".paper-notes" / "write.lock").exists())
+            self.assertEqual(staging_residue(root), [])
+            self._assert_racer_in_recovery(root, racer_content)
+
+    def test_hook_rewriting_library_json_conflicts(self):
+        """成功 rebuild_hook() 外部改写 library.json: the post-hook
+        authority detects the external bytes, the item AND both index
+        files roll back to their exact bytes+mode, the external bytes
+        survive untouched at a named recovery location, the hook ran
+        exactly once, and the deletion is never reported 'deleted' with
+        the external bytes as the final index."""
+        td, root, before, index_before, original_note, hook = self._scenario()
+        with td:
+            external = b'{"papers": {"external": "ext-uuid"}}\n'
+            lib, _al = index_paths(root)
+            calls = {"n": 0}
+
+            def rewriting_hook():
+                calls["n"] += 1
+                lib.write_bytes(external)
+
+            with self.assertRaises(items.ItemConflict) as ctx:
+                confirm(root, get_token(root), hook=rewriting_hook)
+
+            self.assertIn("library.json", str(ctx.exception))
+            self.assertEqual(calls["n"], 1)  # the hook itself ran exactly once
+            self.assertEqual(vault_manifest(root), before)
+            self.assertEqual(note(root, OLD).read_bytes(), original_note)
+            assert_index_restored(self, root, index_before)
+            self.assertFalse(workdir(root).exists())
+            self.assertFalse((root / ".paper-notes" / "write.lock").exists())
+            self.assertEqual(staging_residue(root), [])
+            self._assert_racer_in_recovery(root, external)
+
+    def test_hook_rewriting_citation_aliases_conflicts(self):
+        """成功 rebuild_hook() 外部改写 citation-aliases.json（对称场景）:
+        detected by the post-hook authority; item and both index files
+        restored; the external bytes preserved at a named recovery
+        location; hook ran exactly once."""
+        td, root, before, index_before, original_note, hook = self._scenario()
+        with td:
+            external = b'{"aliases": {"external": "ext"}}\n'
+            _lib, al = index_paths(root)
+            calls = {"n": 0}
+
+            def rewriting_hook():
+                calls["n"] += 1
+                al.write_bytes(external)
+
+            with self.assertRaises(items.ItemConflict) as ctx:
+                confirm(root, get_token(root), hook=rewriting_hook)
+
+            self.assertIn("citation-aliases.json", str(ctx.exception))
+            self.assertEqual(calls["n"], 1)
+            self.assertEqual(vault_manifest(root), before)
+            self.assertEqual(note(root, OLD).read_bytes(), original_note)
+            assert_index_restored(self, root, index_before)
+            self.assertFalse(workdir(root).exists())
+            self.assertFalse((root / ".paper-notes" / "write.lock").exists())
+            self.assertEqual(staging_residue(root), [])
+            self._assert_racer_in_recovery(root, external)
+
+    def test_hook_chmod_index_conflicts(self):
+        """hook 期间 chmod library.json: the post-hook authority detects
+        the mode change; item and both index files roll back to their
+        exact bytes+mode; the chmod'd racer survives at a named recovery
+        location with its mode preserved; hook ran exactly once."""
+        td, root, before, index_before, original_note, hook = self._scenario()
+        with td:
+            lib, _al = index_paths(root)
+            calls = {"n": 0}
+
+            def chmod_hook():
+                calls["n"] += 1
+                os.chmod(lib, 0o600)
+
+            with self.assertRaises(items.ItemConflict) as ctx:
+                confirm(root, get_token(root), hook=chmod_hook)
+
+            self.assertIn("library.json", str(ctx.exception))
+            self.assertEqual(calls["n"], 1)
+            self.assertEqual(vault_manifest(root), before)
+            self.assertEqual(note(root, OLD).read_bytes(), original_note)
+            assert_index_restored(self, root, index_before)
+            self.assertFalse(workdir(root).exists())
+            self.assertFalse((root / ".paper-notes" / "write.lock").exists())
+            self.assertEqual(staging_residue(root), [])
+            # the chmod'd racer survives with its 0600 mode preserved
+            racer_paths = [
+                p
+                for p in (root / ".paper-notes" / "recovery").rglob("*")
+                if p.is_file() and p.name == "library.json"
+            ]
+            self.assertEqual(len(racer_paths), 1)
+            self.assertEqual(stat.S_IMODE(racer_paths[0].lstat().st_mode), 0o600)
+
+    def test_hook_type_swap_index_conflicts(self):
+        """hook 期间 file->directory type swap of library.json: detected
+        by the post-hook authority; the item and both index files are
+        restored (library.json is a regular file again with its exact
+        bytes+mode) and the swapped directory is preserved at a named
+        in-vault recovery location; hook ran exactly once."""
+        td, root, before, index_before, original_note, hook = self._scenario()
+        with td:
+            lib, _al = index_paths(root)
+            calls = {"n": 0}
+
+            def swap_hook():
+                calls["n"] += 1
+                lib.unlink()
+                lib.mkdir()
+
+            with self.assertRaises(items.ItemConflict) as ctx:
+                confirm(root, get_token(root), hook=swap_hook)
+
+            self.assertIn("library.json", str(ctx.exception))
+            self.assertEqual(calls["n"], 1)
+            self.assertEqual(vault_manifest(root), before)
+            self.assertEqual(note(root, OLD).read_bytes(), original_note)
+            assert_index_restored(self, root, index_before)
+            self.assertTrue(lib.is_dir() is False)
+            self.assertFalse(workdir(root).exists())
+            self.assertFalse((root / ".paper-notes" / "write.lock").exists())
+            self.assertEqual(staging_residue(root), [])
+            # the swapped directory was preserved inside the vault
+            dir_racers = [
+                p
+                for p in (root / ".paper-notes" / "recovery").rglob("*")
+                if p.is_dir() and p.name == "library.json"
+            ]
+            self.assertEqual(len(dir_racers), 1)
+            self.assertTrue(dir_racers[0].resolve().is_relative_to(root.resolve()))
+
+    def test_hook_symlink_swap_index_conflicts(self):
+        """hook 期间 file->symlink swap of library.json: detected by the
+        post-hook authority; the item and both index files are restored
+        and the swapped symlink is preserved untouched at a named
+        in-vault recovery location (never followed, never written
+        through); hook ran exactly once."""
+        td, root, before, index_before, original_note, hook = self._scenario()
+        with td:
+            lib, _al = index_paths(root)
+            calls = {"n": 0}
+
+            def swap_hook():
+                calls["n"] += 1
+                lib.unlink()
+                lib.symlink_to("outside-target")
+
+            with self.assertRaises(items.ItemConflict) as ctx:
+                confirm(root, get_token(root), hook=swap_hook)
+
+            self.assertIn("library.json", str(ctx.exception))
+            self.assertEqual(calls["n"], 1)
+            self.assertEqual(vault_manifest(root), before)
+            self.assertEqual(note(root, OLD).read_bytes(), original_note)
+            assert_index_restored(self, root, index_before)
+            self.assertFalse(lib.is_symlink())
+            self.assertFalse(workdir(root).exists())
+            self.assertFalse((root / ".paper-notes" / "write.lock").exists())
+            self.assertEqual(staging_residue(root), [])
+            # the swapped symlink survives untouched inside the vault
+            link_racers = [
+                p
+                for p in (root / ".paper-notes" / "recovery").rglob("*")
+                if p.is_symlink() and p.name == "library.json"
+            ]
+            self.assertEqual(len(link_racers), 1)
+            self.assertEqual(os.readlink(link_racers[0]), "outside-target")
+
+    def test_failure_at_finalize_hook_restores_item_and_indexes(self):
+        """rebuild hook 在 finalize 内失败: an exception raised by the
+        hook inside the participant's finalize is an ItemError that
+        rolls the item AND both index files back to their exact
+        bytes+mode with no residue (the hook itself ran once)."""
+        td, root, before, index_before, original_note, hook = self._scenario()
+        with td:
+            hook = mock.Mock(side_effect=RuntimeError("rebuild boom"))
+            with self.assertRaises(items.ItemError):
+                confirm(root, get_token(root), hook=hook)
+            self.assertEqual(vault_manifest(root), before)
+            self.assertEqual(note(root, OLD).read_bytes(), original_note)
+            assert_index_restored(self, root, index_before)
+            self.assertFalse(workdir(root).exists())
+            self.assertFalse((root / ".paper-notes" / "write.lock").exists())
+            self.assertEqual(staging_residue(root), [])
+            hook.assert_called_once()
+
+    def test_rollback_failure_surfaces_sanitized(self):
+        """rollback 自身失败: a failing rollback surfaces as a sanitized
+        ItemError and never leaks the underlying exception text."""
+        td, root, before, index_before, original_note, hook = self._scenario()
+        with td:
+            secret = "secret: /Users/evil/path sk-1234567890abcdef"
+            real_rollback = fsops.rollback
+
+            def exploding_rollback(op):
+                real_rollback(op)
+                raise OSError(secret)
+
+            hook = mock.Mock(side_effect=RuntimeError("hook boom"))
+            with mock.patch(
+                "paper_notes.deletion.fsops.rollback", side_effect=exploding_rollback
+            ):
+                with self.assertRaises(items.ItemError) as ctx:
+                    confirm(root, get_token(root), hook=hook)
+            self.assertNotIn(secret, str(ctx.exception))
+            self.assertNotIn("sk-", str(ctx.exception))
+            self.assertFalse((root / ".paper-notes" / "write.lock").exists())
+
+    def test_success_hook_writes_outside_transaction_preserved(self):
+        """success exactly-once: a legitimate hook side effect on a path
+        OUTSIDE the transaction targets (the authority only guards the
+        staged targets) is preserved, the item deletion and both index
+        files' managed new state are visible together, the hook ran
+        exactly once, and no staging/work/lock residue remains."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            make_vault(root)
+            before = vault_manifest(root)
+            removed_rel = sorted(
+                [str(p.relative_to(root)) for p in item(root, OLD).rglob("*")]
+                + [str(item(root, OLD).relative_to(root))]
+            )
+            lib, al, lib_b, al_b, lib_m, al_m = seed_index(
+                root,
+                library={"papers": {OLD: PAPER_ID, OTHER: "other-uuid"}},
+                aliases={"aliases": {ALIAS: OLD, "smithAlias": "smithExample2026"}},
+            )
+            scratch = root / LIT / "hook-scratch.md"
+            scratch_bytes = b"# hook side effect\n"
+            calls = {"n": 0}
+            real_finalize = deletion.IndexParticipant.finalize
+            finalizes = []
+
+            def side_writing_hook():
+                calls["n"] += 1
+                scratch.write_bytes(scratch_bytes)
+
+            def counting_finalize(self, hook_):
+                finalizes.append(1)
+                return real_finalize(self, hook_)
+
+            with mock.patch.object(
+                deletion.IndexParticipant, "finalize", counting_finalize
+            ):
+                result = confirm(root, get_token(root), hook=side_writing_hook)
+
+            self.assertEqual(result.status, "deleted")
+            self.assertEqual(calls["n"], 1)
+            self.assertEqual(finalizes, [1])
+            self.assertFalse(item(root, OLD).exists())
+            self.assertEqual(
+                json.loads(lib.read_text()), {"papers": {OTHER: "other-uuid"}}
+            )
+            self.assertEqual(
+                json.loads(al.read_text()), {"aliases": {"smithAlias": "smithExample2026"}}
+            )
+            # the hook's own side effect is preserved untouched
+            self.assertEqual(scratch.read_bytes(), scratch_bytes)
+            after = vault_manifest(root)
+            added, removed, changed = manifest_diff(before, after)
+            self.assertEqual(added, [str(scratch.relative_to(root))])
+            self.assertEqual(changed, [])
+            self.assertEqual(removed, removed_rel)
+            self.assertFalse((root / ".paper-notes" / "write.lock").exists())
+            self.assertEqual(staging_residue(root), [])
+            self.assertFalse(workdir(root).exists())
 
 
 class RecoverySeamTest(unittest.TestCase):
