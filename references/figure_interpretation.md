@@ -39,10 +39,11 @@
 
 ## 图片嵌入
 
-- **唯一图片来源**：`scripts/render_pdf_figure.py` 从 **Zotero 原 PDF** 以 ≥300 dpi 渲染的**完整整图** PNG（`![[<64位hex>.png]]`，content-addressed，已落该篇 `<paper_dir>/Figure_<paper_title>/`）。MinerU JPG（低像素碎片）**不进入附件目录**，也绝不作为插图。
-- **流程**：对每张主图/补充图——① 在 Zotero 原 PDF 中定位 caption 页；② 渲染临时整页预览（/tmp）供视觉确认；③ 视觉确认 bbox 恰好框住**完整整图**（含全部 panel/子标签，不含 caption 与正文）；④ 调 `render_pdf_figure.py` 输出 300dpi PNG 到该篇 `<paper_dir>/Figure_<paper_title>/`；⑤ 同一 `![[<64位hex>.png]]`（同一文件、同一 embed）先嵌入 minerUmd 对应 Figure legend 前，再在 Figure解读 对应 `## Figure X/SX` 标题**之后、叙事位置之前**嵌入。
-- **每图只放一张完整整图**：禁止把 panel/图标碎片堆进笔记；某图无法从原 PDF 可靠定位完整整图时，该位置写「*原 PDF 未能可靠定位完整 Figure*」，**不得猜裁**、不得张冠李戴。
+- **唯一图片来源**：`scripts/render_pdf_figure.py` 从该篇 **canonical 主 PDF**（`<paper_dir>/<citation_key>.pdf`）以 ≥300 dpi 渲染的**完整整图** PNG（`![[<64位hex>.png]]`，content-addressed，已落该篇 `<paper_dir>/figures/`）。MinerU JPG（低像素碎片）只作定位线索，**不进入附件目录**，也绝不作为插图。
+- **流程**：对每张主图/补充图——① 在 canonical 主 PDF 中定位 caption 页；② 渲染临时整页预览（/tmp）供视觉确认；③ 视觉确认 bbox 恰好框住**完整整图**（含全部 panel/子标签，不含 caption 与正文）；④ 调 `render_pdf_figure.py` 输出 300dpi PNG 到该篇 `<paper_dir>/figures/`；⑤ 同一 `![[<64位hex>.png]]`（同一文件、同一 embed）先嵌入 minerUmd 对应 Figure legend 前，再在 Figure解读 对应 `## Figure X/SX` 标题**之后、叙事位置之前**嵌入。
+- **每图只放一张完整整图**：禁止把 panel/图标碎片堆进笔记；某图无法从主 PDF 可靠定位完整整图时，该位置写「*原 PDF 未能可靠定位完整 Figure*」，**不得猜裁**、不得张冠李戴。
 - **同图多张**（罕见，整图分页排版）按原 PDF 顺序排列，仍只放完整整图。
+- 旧布局（legacy）曾把高清 PNG 落 `<paper_dir>/Figure_<paper_title>/`；该布局已废弃，迁移后统一落 `<paper_dir>/figures/`。
 
 ## 独立任务：仅从 minerUmd 写完整 Figure解读
 
@@ -51,13 +52,13 @@
 0. **文首 Overview（强制）**：frontmatter 之后、第一张 Figure 之前写 `## Overview`——4–6 条 `**维度名**：` bullet（研究背景/问题、研究脉络、主要方法、关键结论/意义），读者只看 Overview 即懂全文脉络与方法；禁止长段落。
 1. **对齐库内范例**（同 vault `05 Literature/`）：主图 panel 用 是什么/为什么/怎么做/**发现** 四维；补充图**与主图相同格式**逐图排版（可参考 `nishide`、`shimagami`、`dann` 等已写笔记）。
 2. **先通读 minerUmd 全文**（含 Results + Methods 中对 fig. S 的引用），再写；勿只扫 Figure 标题。
-3. **图注来源优先级**：minerUmd 内完整 Fig legend → Zotero 主 PDF（`~/Zotero/storage/<key>/…pdf`，PyMuPDF 抽文本）→ 补充 PDF（若有）→ 正文/方法归纳（必须标明，见下）。
+3. **图注来源优先级**：minerUmd 内完整 Fig legend → canonical 主 PDF（`<paper_dir>/<citation_key>.pdf`，PyMuPDF 抽文本）→ 补充 PDF（`attachments/` 内，若有）→ 正文/方法归纳（必须标明，见下）。
 4. **Science / 主文 PDF 无 SM 图注时**：minerUmd 往往只有 Fig.1–6 完整 panel 图注，S1–S33 仅正文 `fig. Sx` 引用。**禁止**留空或假写逐字 SM legend。应：
    - 主图：尽量用 PDF/minerUmd **逐字** legend 放进 `>`；
    - 补充图：**仍逐图排版**（`## Figure S…`＋图片嵌入＋`> **叙事位置**`＋逐 panel 四维解读）；「原文 Legend」写正文/方法指向的内容摘要，并在该图下注明：*主 PDF 无完整 SM 图注；此 Legend 据正文引用与 Methods 归纳，非出版社逐字图注*。
-5. **高清插图渲染（与完整流程同规）**：所有 `![[<64位hex>.png]]` 必须由 `scripts/render_pdf_figure.py` 从 **Zotero 原 PDF**（frontmatter `zotero link` 对应条目的附件，`$HOME/Zotero/storage/<attachment-key>/<filename>.pdf`）以 300dpi 渲染的**完整整图**，落该篇 `<paper_dir>/Figure_<paper_title>/` 后在 `## Figure X/SX` 标题之后、叙事之前嵌入；minerUmd 中同一 embed 插在对应 legend 前（若缺失）。每图只放完整整图；定位流程与不可靠声明见「图片嵌入」节。
+5. **高清插图渲染（与完整流程同规）**：所有 `![[<64位hex>.png]]` 必须由 `scripts/render_pdf_figure.py` 从该篇 **canonical 主 PDF**（`<paper_dir>/<citation_key>.pdf`）以 300dpi 渲染的**完整整图**，落该篇 `<paper_dir>/figures/` 后在 `## Figure X/SX` 标题之后、叙事之前嵌入；minerUmd 中同一 embed 插在对应 legend 前（若缺失）。每图只放完整整图；定位流程与不可靠声明见「图片嵌入」节。
 6. **落盘**：中文路径必须用 `terminal` + `python3` + `Path.write_text`；**不要**把含中文的 vault 路径设为 Hermes `terminal` 的 `workdir`（会直接 Blocked）。`workdir` 用英文路径或省略，文件路径写在 Python 字符串里。
-7. **自检**：`**是什么**` 与 `**发现**` 计数应接近主图 panel 数；文件通常 >10KB；frontmatter 含 `状态: 未读`、两个**顶层**属性 `minerU: "[[minerUmd_…]]"` 与 `zotero link: zotero://…`（禁止嵌套在 `source:` 下）；文首含 `## Overview`（4–6 条 `**维度名**：` bullet）；每张 Figure 标题后有且仅有一张 `![[<64位hex>.png]]` 高清整图（或「原 PDF 未能可靠定位完整 Figure」声明）。
+7. **自检**：`**是什么**` 与 `**发现**` 计数应接近主图 panel 数；文件通常 >10KB；frontmatter 含最小关系字段 `paper_id` / `citation_key` / `paper: "[[<citation_key>]]"`（**不要**添加 `tags`、`type`）；文首含 `## Overview`（4–6 条 `**维度名**：` bullet）；每张 Figure 标题后有且仅有一张 `![[<64位hex>.png]]` 高清整图（或「原 PDF 未能可靠定位完整 Figure」声明）。
 
 ## Overview（文首必填）
 
@@ -89,7 +90,7 @@
 **补充图与主图相同格式**：逐图排版，旧表格格式已废弃。每张补充图：
 
 1. **标题**：`## Figure SX. Title`（与主图同级）
-2. **图片嵌入**：`## Figure SX` 标题之后立即 `![[<64位hex>.png]]`（Step 6 / 独立任务渲染的高清整图，多图按原顺序；不可靠时写「原 PDF 未能可靠定位完整 Figure」，不得猜裁）
+2. **图片嵌入**：`## Figure SX` 标题之后立即 `![[<64位hex>.png]]`（渲染的高清整图，多图按原顺序；不可靠时写「原 PDF 未能可靠定位完整 Figure」，不得猜裁）
 3. **叙事位置**：`> **叙事位置**：...` 一句话
 4. **逐 panel**：`**Panel X — 简短描述**` + `>` 原文 legend + `- **是什么/为什么/怎么做/发现**`——与主图完全一致
 5. **缺出版社 legend 时**：仍逐图排版；该图下注明「据正文/Methods 归纳，非出版社逐字图注」，禁止空图

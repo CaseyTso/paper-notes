@@ -17,13 +17,15 @@
 
 ## 推荐手动流水线（大 PDF > ~8MB）
 
+canonical 布局下，输出目录 = vault 内 `05 Literature/<citation_key>/`（主 PDF 已在该目录，即 `<citation_key>.pdf`）。
+
 ```bash
 source ~/.zshrc   # MINERU_TOKEN
-PDF_ORIG=".../paper.pdf"
-OUT=".../paper_title"   # 输出目录 = vault 内 05 Literature/<消毒后论文全标题>
+PDF_ORIG="<paper_dir>/<citation_key>.pdf"
+OUT="<paper_dir>"   # = <vault>/05 Literature/<citation_key>
 mkdir -p "$OUT"
 
-# 1) 可选：压到 ~6MB 量级（PyMuPDF；压缩产物仅供 MinerU OCR/结构解析，最终插图从 Zotero 原 PDF 渲染）
+# 1) 可选：压到 ~6MB 量级（PyMuPDF；压缩产物仅供 MinerU OCR/结构解析，最终插图从 canonical 主 PDF 渲染）
 python3 - <<'PY'
 import fitz, os
 src, dst = "PDF_ORIG", "OUT/paper_small.pdf"  # 替换路径
@@ -67,9 +69,9 @@ curl --noproxy '*' -L -o "$OUT/mineru_result.zip" --max-time 180 "$ZIP_URL"
 unzip -o "$OUT/mineru_result.zip" -d "$OUT/mineru_extract"
 cp "$OUT/mineru_extract/full.md" "$OUT/full.md"
 mkdir -p "$OUT/images" && cp -R "$OUT/mineru_extract/images/"* "$OUT/images/" 2>/dev/null || true
-# 图片暂存论文目录 images/ 仅作定位线索（MinerU JPG 低像素，不进入附件目录）；
-# 清洗时 clean_md.py 不带 --attachments-dir（删除图片引用）并删除 images/；
-# 高清插图由 render_pdf_figure.py 从 Zotero 原 PDF 渲染（主 SKILL Step 6）
+# 图片暂存论文目录 images/ 仅作定位线索（MinerU JPG 低像素，绝不作为最终插图）；
+# 清洗时 clean_md.py 把它们迁移到 <paper_dir>/attachments/（或按旧调用不带 --attachments-dir 直接删除引用）；
+# 高清插图由 render_pdf_figure.py 从 canonical 主 PDF 渲染（主 SKILL「高清 Figure 渲染」节）
 ```
 
 ## 不要做
@@ -77,7 +79,8 @@ mkdir -p "$OUT/images" && cp -R "$OUT/mineru_extract/images/"* "$OUT/images/" 2>
 - 不要把 Cell/PMC 付费墙 HTML URL 丢给 `/api/v4/extract/task` 当主路径
 - 不要对 OSS PUT 使用 `--noproxy '*'`（本环境曾导致 Expect:100 后长时间无进度）
 - 不要在 CDN 下载时强制走 7897 代理（优先 noproxy）
+- 不要把 MinerU 输出目录指向该篇 `figures/`（最终 figure 资产只由 `render_pdf_figure.py` 写入）
 
 ## 与脚本关系
 
-`scripts/mineru_upload.py` 适合小 PDF 一键跑通。大 PDF / 代理卡顿时改用本页分步流水线，再用 `clean_md.py`（不带 `--attachments-dir`，删除 MinerU 图片引用）→ `render_pdf_figure.py`（从原 PDF 渲染高清 Figure）→ 后续 frontmatter 步骤。
+`scripts/mineru_upload.py` 适合小 PDF 一键跑通；带 `--citation-key <ckey>` 时清洗后的笔记直接定稿为 `minerUmd_<citation_key>.md`（不带则保持旧 `full.md` 名）。大 PDF / 代理卡顿时改用本页分步流水线，再用 `clean_md.py`（`--attachments-dir <paper_dir>/attachments/` 迁移 MinerU 图片为 Obsidian embeds，或按旧调用删除图片引用）→ `render_pdf_figure.py`（从 canonical 主 PDF 渲染高清 Figure 到 `<paper_dir>/figures/`）→ 后续 frontmatter 步骤。

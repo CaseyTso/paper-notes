@@ -16,16 +16,16 @@ from pathlib import Path
 
 vault = Path("/path/to/vault/05 Literature")
 
-# 键 = 消毒后的论文全标题目录名（见 frontmatter_spec 的 paper_title）
+# 键 = canonical citation key 目录名（见 frontmatter_spec 的 canonical 布局）
 papers = {
-    "paper_title_1": {
+    "citation_key_1": {
         "zip_url": "https://cdn-mineru.openxlab.org.cn/pdf/.../xxx.zip",
     },
-    "paper_title_2": { ... },
+    "citation_key_2": { ... },
 }
 
-for name, info in papers.items():
-    d = vault / info["paper_title"]
+for key, info in papers.items():
+    d = vault / key
     zip_path = d / "mineru.zip"
     extract_dir = d / "mineru_extract"
     extract_dir.mkdir(parents=True, exist_ok=True)
@@ -47,10 +47,12 @@ for name, info in papers.items():
 ## 步骤
 
 1. 从各进程输出中提取 `zip_url`（`Failed to download https://cdn-mineru...zip`）
-2. 填入脚本 `papers` dict
+2. 填入脚本 `papers` dict（键 = `05 Literature/<citation_key>/` 目录名）
 3. 运行 → 全部并行下载
 4. 验证每目录有 `full.md`（>10KB）和 `images/`（>0 文件）
 
 ## 后续
 
-下载完成后继续 `clean_md.py`（不带 `--attachments-dir`；MinerU JPG 只作定位线索，清洗时删除引用与 `images/`，不迁入附件）→ `render_pdf_figure.py` 从各篇 **Zotero 原 PDF** 渲染 300dpi 高清整图入各篇 `<paper_dir>/Figure_<paper_title>/`（`<paper_dir>` = `<vault>/05 Literature/<paper_title>/`）→ frontmatter → 重命名为 `minerUmd_<ckey>.md`，然后 `delegate_task` 并行写 Figure解读（与 minerUmd 复用同一 `![[<64位hex>.png]]` embed）。
+下载完成后继续 `clean_md.py`（`--attachments-dir <paper_dir>/attachments/` 迁移 MinerU 图片为该篇附件 embeds；MinerU JPG 只作定位线索，绝不进 `figures/`）→ `render_pdf_figure.py` 从各篇 canonical 主 PDF（`<paper_dir>/<citation_key>.pdf`）渲染 300dpi 高清整图入各篇 `<paper_dir>/figures/` → frontmatter → 定稿为 `minerUmd_<citation_key>.md`，然后并行写 Figure解读（与 minerUmd 复用同一 `![[<64位hex>.png]]` embed）。
+
+> 旧布局（legacy）曾以论文全标题为目录名、把高清 PNG 落 `<paper_dir>/Figure_<paper_title>/`；该布局已废弃，迁移后统一使用 `<citation_key>` 目录与 `<paper_dir>/figures/`（详见 `migration.md`）。

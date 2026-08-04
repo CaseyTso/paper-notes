@@ -1,11 +1,11 @@
 # MinerU：单 batch 多文件上传（批量导入实测）
 
-适用于一次摄入 2–N 篇本地 PDF（Zotero 拷贝到 `05 Literature/<paper_title>/` 后）。
+适用于一次摄入 2–N 篇本地 PDF（canonical 布局下，PDF 位于各篇 `05 Literature/<citation_key>/<citation_key>.pdf`）。
 
 ## 何时用
 
 - 批量导入；希望 **一个 `batch_id` 统一轮询**
-- 大 PDF 已压到约 5–8MB（见 `mineru_upload_proxy.md`；压缩仅供 MinerU OCR，插图从原 PDF 渲染）
+- 大 PDF 已压到约 5–8MB（见 `mineru_upload_proxy.md`；压缩仅供 MinerU OCR，插图从各篇 canonical 主 PDF 渲染）
 
 ## 流水线
 
@@ -54,15 +54,16 @@ curl -X PUT --data-binary @"$PDF" -H "Content-Type:" \
 ```bash
 curl --noproxy '*' -L -o "$OUT/mineru_result.zip" --max-time 180 "$ZIP_URL"
 unzip -o "$OUT/mineru_result.zip" -d "$OUT/mineru_extract"
-cp "$OUT/mineru_extract/full.md" "$OUT/full.md"   # 或 rglob full.md
-# images → $OUT/images/
+# 各篇 output_dir = 05 Literature/<citation_key>/；清洗后的笔记定稿为 minerUmd_<citation_key>.md
 ```
 
-然后按主 skill：**clean_md（不带 `--attachments-dir`，删除 MinerU 图片引用；MinerU JPG 只作定位线索，清洗时删除 `images/`，不迁入附件）→ render_pdf_figure.py（从各篇 Zotero 原 PDF 渲染 300dpi 高清整图入各篇 `<paper_dir>/Figure_<paper_title>/`；`<paper_dir>` = `<vault>/05 Literature/<paper_title>/`）→ frontmatter → 重命名 minerUmd_<ckey>.md → 删 PDF/zip/mineru_extract 与论文目录 images/**。clean_md 非零退出即整体失败、MD 未动。
+然后按主 skill 逐篇：**clean_md（`--attachments-dir <paper_dir>/attachments/` 把 MinerU 图片迁移为该篇附件 embeds；MinerU JPG 只作定位线索，绝不进该篇 `figures/`）→ render_pdf_figure.py（从各篇 canonical 主 PDF `<paper_dir>/<citation_key>.pdf` 渲染 300dpi 高清整图入各篇 `<paper_dir>/figures/`）→ frontmatter（派生笔记最小关系字段）→ 删除临时产物（zip / mineru_extract / images 暂存；**不删除** `<citation_key>.pdf` 与 `figures/` 内容）。** clean_md 非零退出即整体失败、MD 未动。
+
+> 旧布局（legacy）曾以论文全标题为目录名、把高清 PNG 落 `<paper_dir>/Figure_<paper_title>/`；该布局已废弃，迁移后统一使用 `<citation_key>` 目录与 `<paper_dir>/figures/`（详见 `migration.md`）。
 
 ## 与单篇脚本关系
 
-- `scripts/mineru_upload.py`：单篇一键；小 PDF 优先
+- `scripts/mineru_upload.py`：单篇一键；小 PDF 优先（带 `--citation-key <ckey>` 定稿 `minerUmd_<citation_key>.md`）
 - 本页：多篇同批 / 大 PDF 压缩后批量
 - CDN/SSL/代理坑：仍以 `mineru_upload_proxy.md` 为准
 
