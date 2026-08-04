@@ -283,7 +283,9 @@ def build_parser(json_mode: bool) -> _JsonAwareArgumentParser:
         json_mode=json_mode,
     )
     legacy_parser.add_argument(
-        "--vault", required=True, help="vault root directory"
+        "--vault",
+        help="vault root directory (required for --dry-run; optional for "
+        "--apply when the manifest records it)",
     )
     legacy_parser.add_argument(
         "--keys",
@@ -302,7 +304,47 @@ def build_parser(json_mode: bool) -> _JsonAwareArgumentParser:
         action="store_true",
         help="build the plan and confirmation token without writing to the vault",
     )
+    legacy_parser.add_argument(
+        "--apply",
+        help="apply a previously reviewed migration plan (run id)",
+    )
+    legacy_parser.add_argument(
+        "--confirm-token",
+        help="confirmation token from the matching dry run",
+    )
     legacy_parser.set_defaults(func=_cmd_migrate_legacy_obsidian)
+
+    verify_parser = migrate_subparsers.add_parser(
+        "verify",
+        help="verify an applied migration run against its backup",
+        json_mode=json_mode,
+    )
+    verify_parser.add_argument("run_id", help="migration run id")
+    verify_parser.add_argument(
+        "--vault", help="vault root (default: recorded in the manifest)"
+    )
+    verify_parser.add_argument(
+        "--state-root",
+        help="state root for manifests/backups "
+        "(default: ~/Library/Application Support/paper-notes/migrations)",
+    )
+    verify_parser.set_defaults(func=_cmd_migrate_verify)
+
+    rollback_parser = migrate_subparsers.add_parser(
+        "rollback",
+        help="restore the original source trees of an applied migration run",
+        json_mode=json_mode,
+    )
+    rollback_parser.add_argument("run_id", help="migration run id")
+    rollback_parser.add_argument(
+        "--vault", help="vault root (default: recorded in the manifest)"
+    )
+    rollback_parser.add_argument(
+        "--state-root",
+        help="state root for manifests/backups "
+        "(default: ~/Library/Application Support/paper-notes/migrations)",
+    )
+    rollback_parser.set_defaults(func=_cmd_migrate_rollback)
     return parser
 
 
@@ -402,17 +444,62 @@ def _cmd_config_easyscholar_root(args: argparse.Namespace) -> Envelope:
 
 
 def _cmd_migrate_root(args: argparse.Namespace) -> Envelope:
-    raise UserError("missing migrate subcommand: use legacy-obsidian")
+    raise UserError(
+        "missing migrate subcommand: use legacy-obsidian, verify, or rollback"
+    )
 
 
 def _cmd_migrate_legacy_obsidian(args: argparse.Namespace) -> Envelope:
     from .migration import build_migration_plan, default_state_root
+    from .migration.transaction import (
+        MigrationConflict,
+        MigrationError,
+        apply_migration,
+        record_vault_root,
+    )
 
+    state_root = Path(args.state_root) if args.state_root else default_state_root()
+
+    if args.apply:
+        if args.dry_run:
+            raise UserError("cannot combine --apply with --dry-run")
+        if not args.confirm_token:
+            raise UserError(
+                "migrate legacy-obsidian --apply requires --confirm-token"
+            )
+        if args.keys or args.keys_file:
+            raise UserError("cannot combine --apply with --keys/--keys-file")
+        vault = Path(args.vault) if args.vault else None
+        try:
+            result = apply_migration(
+                args.apply,
+                args.confirm_token,
+                vault_root=vault,
+                state_root=state_root,
+            )
+        except MigrationError as exc:
+            raise UserError(str(exc)) from exc
+        except MigrationConflict as exc:
+            raise ConflictError(str(exc)) from exc
+        return success(
+            {
+                "action": result.status,
+                "run_id": result.run_id,
+                "vault_root": result.vault_root,
+                "state_root": result.state_root,
+                "migrated": list(result.migrated),
+                "skipped": list(result.skipped),
+            }
+        )
+
+    if args.confirm_token:
+        raise UserError("--confirm-token requires --apply")
     if not args.dry_run:
         raise UserError(
-            "migrate legacy-obsidian requires --dry-run in this release; "
-            "--apply arrives with the apply engine (Task 18)"
+            "migrate legacy-obsidian requires --dry-run or --apply"
         )
+    if not args.vault:
+        raise UserError("migrate legacy-obsidian --dry-run requires --vault")
     if args.keys and args.keys_file:
         raise UserError("cannot combine --keys with --keys-file")
     keys: list[str] | None = None
@@ -427,17 +514,17 @@ def _cmd_migrate_legacy_obsidian(args: argparse.Namespace) -> Envelope:
             ]
         except OSError as exc:
             raise UserError(f"cannot read keys file {args.keys_file}: {exc}") from exc
-    state_root = (
-        Path(args.state_root) if args.state_root else default_state_root()
-    )
-    plan = build_migration_plan(
-        Path(args.vault), keys=keys, state_root=state_root
-    )
+    vault = Path(args.vault)
+    plan = build_migration_plan(vault, keys=keys, state_root=state_root)
+    # Record the vault root so apply/verify/rollback can locate it later
+    # without repeating --vault (additive; the token is unaffected).
+    record_vault_root(plan.manifest_path, vault)
     return needs_confirmation(
         {
             "action": "migrate_legacy_obsidian",
             "run_id": plan.run_id,
             "confirmation_token": plan.confirmation_token,
+            "vault_root": str(vault.resolve()),
             "state_root": str(plan.state_root),
             "manifest_path": str(plan.manifest_path),
             "items": list(plan.items),
@@ -446,6 +533,81 @@ def _cmd_migrate_legacy_obsidian(args: argparse.Namespace) -> Envelope:
                 "vault_writes": 0,
                 "state_root": str(plan.state_root),
             },
+        }
+    )
+
+
+def _cmd_migrate_verify(args: argparse.Namespace) -> Envelope:
+    from .migration import default_state_root
+    from .migration.transaction import (
+        MigrationError,
+        verify_migration,
+    )
+
+    state_root = Path(args.state_root) if args.state_root else default_state_root()
+    vault = Path(args.vault) if args.vault else None
+    try:
+        report = verify_migration(
+            args.run_id, vault_root=vault, state_root=state_root
+        )
+    except MigrationError as exc:
+        raise UserError(str(exc)) from exc
+    items = [
+        {
+            "source_dir": entry["source_dir"],
+            "citation_key": entry["citation_key"],
+            "status": entry["status"],
+            "problems": entry["problems"],
+        }
+        for entry in report.items
+    ]
+    base = {
+        "run_id": report.run_id,
+        "status": report.status,
+        "applied": report.applied,
+        "pending": report.pending,
+        "skipped": report.skipped,
+        "problems": report.problems,
+        "items": items,
+    }
+    if report.status == "problems":
+        return error(
+            [
+                Issue(
+                    code="verify_problem",
+                    message=f"{entry['source_dir']}: {problem['message']}",
+                    path=problem.get("path"),
+                )
+                for entry in report.items
+                for problem in entry["problems"]
+            ]
+        )
+    return success(base)
+
+
+def _cmd_migrate_rollback(args: argparse.Namespace) -> Envelope:
+    from .migration import default_state_root
+    from .migration.transaction import (
+        MigrationConflict,
+        MigrationError,
+        rollback_migration,
+    )
+
+    state_root = Path(args.state_root) if args.state_root else default_state_root()
+    vault = Path(args.vault) if args.vault else None
+    try:
+        result = rollback_migration(
+            args.run_id, vault_root=vault, state_root=state_root
+        )
+    except MigrationError as exc:
+        raise UserError(str(exc)) from exc
+    except MigrationConflict as exc:
+        raise ConflictError(str(exc)) from exc
+    return success(
+        {
+            "action": result.status,
+            "run_id": result.run_id,
+            "restored": list(result.restored),
         }
     )
 
