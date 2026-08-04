@@ -111,6 +111,25 @@ class RedactionTest(unittest.TestCase):
         self.assertEqual(config.redact_text("plain message", None), "plain message")
 
 
+class ConfigReprTest(unittest.TestCase):
+    """repr/str must never render the secret value (repair R1)."""
+
+    def test_repr_never_contains_secret(self):
+        cfg = config.Config(easyscholar_secret_key=SECRET)
+        self.assertNotIn(SECRET, repr(cfg))
+        self.assertNotIn(SECRET, str(cfg))
+
+    def test_repr_shows_mask_when_secret_present(self):
+        cfg = config.Config(easyscholar_secret_key=SECRET)
+        self.assertIn(config.MASK, repr(cfg))
+        self.assertIn(config.MASK, str(cfg))
+
+    def test_repr_without_secret_shows_none(self):
+        self.assertEqual(
+            repr(config.Config()), "Config(easyscholar_secret_key=None)"
+        )
+
+
 class ConfigImportCliTest(unittest.TestCase):
     """CLI integration for ``config easyscholar import-zotero``.
 

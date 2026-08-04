@@ -167,6 +167,36 @@ class QueryTest(unittest.TestCase):
             with self.assertRaises(easyscholar.EasyScholarError):
                 easyscholar.EasyScholarAdapter(SECRET).query(journal="Nature Medicine")
 
+    def test_api_msg_echoing_secret_is_redacted(self):
+        payload = {"code": 4002, "msg": "invalid secret key " + SECRET, "data": None}
+        with mock.patch.object(
+            easyscholar.requests, "get", return_value=_json_response(payload)
+        ):
+            with self.assertRaises(easyscholar.EasyScholarError) as ctx:
+                easyscholar.EasyScholarAdapter(SECRET).query(journal="Nature Medicine")
+        self.assertNotIn(SECRET, str(ctx.exception))
+        self.assertIn("****", str(ctx.exception))
+
+    def test_transport_error_does_not_chain_secret_bearing_cause(self):
+        import requests
+        import traceback
+
+        cause = requests.ConnectionError(
+            "failed: https://www.easyscholar.cc/openInfo/getSearchData?secretKey="
+            + SECRET
+        )
+        with mock.patch.object(easyscholar.requests, "get", side_effect=cause):
+            with self.assertRaises(easyscholar.EasyScholarError) as ctx:
+                easyscholar.EasyScholarAdapter(SECRET).query(journal="Nature Medicine")
+        self.assertIsNone(ctx.exception.__cause__)
+        self.assertNotIn(SECRET, str(ctx.exception))
+        tb = "".join(
+            traceback.format_exception(
+                type(ctx.exception), ctx.exception, ctx.exception.__traceback__
+            )
+        )
+        self.assertNotIn(SECRET, tb)
+
 
 class NoWriteGuaranteeTest(unittest.TestCase):
     def test_query_leaves_fixture_markdown_unchanged(self):

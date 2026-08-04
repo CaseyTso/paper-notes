@@ -20,6 +20,7 @@ from typing import Any
 
 import requests
 
+from paper_notes import config as _config
 from paper_notes.adapters import AdapterError
 
 API_URL = "https://www.easyscholar.cc/openInfo/getSearchData"
@@ -102,8 +103,10 @@ class EasyScholarAdapter:
             params["issn"] = issn
         try:
             response = requests.get(API_URL, params=params, timeout=self.timeout)
-        except requests.RequestException as exc:
-            raise EasyScholarError("easyscholar request failed") from exc
+        except requests.RequestException:
+            # Never chain the transport exception: its repr may embed the
+            # request URL, which carries ``secretKey`` in the query string.
+            raise EasyScholarError("easyscholar request failed") from None
         if response.status_code != 200:
             raise EasyScholarError(
                 f"easyscholar returned HTTP {response.status_code}"
@@ -117,7 +120,13 @@ class EasyScholarAdapter:
         code = payload.get("code")
         if code != 0:
             message = _first_str(payload.get("msg")) or "unknown error"
-            raise EasyScholarError(f"easyscholar error {code}: {message}")
+            # API messages can echo the credential back; redact every
+            # outward-facing message before it reaches logs or the CLI.
+            raise EasyScholarError(
+                _config.redact_text(
+                    f"easyscholar error {code}: {message}", self.secret_key
+                )
+            )
         data = payload.get("data")
         if not isinstance(data, list) or not data:
             raise EasyScholarError("easyscholar returned no matching journal")

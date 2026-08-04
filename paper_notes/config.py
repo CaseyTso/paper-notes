@@ -31,6 +31,13 @@ class Config:
 
     easyscholar_secret_key: str | None = None
 
+    def __repr__(self) -> str:
+        key = MASK if self.easyscholar_secret_key else None
+        return f"Config(easyscholar_secret_key={key!r})"
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
 
 def default_config_path() -> Path:
     """macOS private config location (or ``PAPER_NOTES_CONFIG`` override)."""
