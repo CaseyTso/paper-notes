@@ -106,6 +106,18 @@ Contract (spec §8.3 + plan Task 14 + manager approval):
   retry_cleanup() is an idempotent, vault-bound, symlink-safe retry
   seam that never follows symlinks and never overwrites external
   files.
+- Repair-R6 v2 frozen regressions (identity-protected staging entry
+  removal, each verified red on 178d3c3): after the dirfd chain is
+  anchored, the staging operation directory may be renamed away and
+  the original pathname replaced by a late same-name racer — an empty
+  directory, a regular file or a symlink (including one pointing
+  outside the vault). The cleanup acts on the anchored inode only:
+  the late racer is never deleted (an empty-directory racer is never
+  destroyed by a pathname os.rmdir), never followed, and is reported
+  as residue; the anchored inode's own entry is located by inode
+  identity and removed even after a rename; _remove_staging_dir
+  returns an explicit clean / cleanup-required verdict supporting
+  idempotent retry.
 """
 
 import contextlib
@@ -291,6 +303,35 @@ def seed_index(root, library=None, aliases=None):
         encoding="utf-8",
     )
     return lib, al, lib.read_bytes(), al.read_bytes(), lib.lstat().st_mode, al.lstat().st_mode
+
+
+def assert_index_restored(testcase, root, before):
+    lib, al = index_paths(root)
+    testcase.assertEqual(lib.read_bytes(), before[2])
+    testcase.assertEqual(al.read_bytes(), before[3])
+    testcase.assertEqual(stat.S_IMODE(lib.lstat().st_mode), stat.S_IMODE(before[4]))
+    testcase.assertEqual(stat.S_IMODE(al.lstat().st_mode), stat.S_IMODE(before[5]))
+
+
+def _late_racer_swap(staging, racer_kind, outside=None):
+    """Deterministic 'late same-name racer' injection: rename the
+    staging operation directory away inside its parent and plant a
+    same-name replacement — an empty directory (``"dir"``), a regular
+    file (``"file"``) or a symlink to an outside sentinel directory
+    (``"symlink"``) — at the original pathname. Exactly the swap that
+    can happen after the dirfd chain is anchored. Returns the
+    renamed-away original path (its contents are the anchored inode's
+    own transaction material)."""
+    renamed = staging.parent / (staging.name + ".racer")
+    os.replace(staging, renamed)
+    if racer_kind == "dir":
+        staging.mkdir()
+    elif racer_kind == "file":
+        staging.write_bytes(b"racer-file-bytes")
+        staging.chmod(0o640)
+    else:
+        staging.symlink_to(outside, target_is_directory=True)
+    return renamed
 
 
 def assert_index_restored(testcase, root, before):
@@ -2410,6 +2451,205 @@ class CleanupFailureTest(unittest.TestCase):
                 again = deletion.retry_cleanup(root, operation_id=op_id)
                 self.assertTrue(again.cleaned)
                 self.assertEqual(again.residue, ())
+
+    def test_late_same_name_empty_dir_racer_preserved(self):
+        """Frozen R6 v2: the staging operation directory is renamed
+        away and an EMPTY DIRECTORY is planted at the same pathname
+        after the dirfd chain is anchored. The cleanup acts on the
+        anchored inode only: the planted empty dir is never deleted by
+        a pathname rmdir (red on 178d3c3 — the blind
+        ``os.rmdir(name, dir_fd=parent_fd)`` silently destroys it), the
+        anchored original is emptied and its entry removed by inode
+        identity, and the verdict is an explicit cleanup-required."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            make_vault(root)
+            op_id = "a" * 32
+            staging = root / ".paper-notes" / ".staging" / op_id
+            staging.mkdir(parents=True)
+            (staging / "snap.bin").write_bytes(b"snap-bytes")
+            real_chain = deletion._open_staging_chain
+            state = {"swapped": False}
+
+            def swap_after_anchor(vault, directory):
+                pair = real_chain(vault, directory)
+                if pair is not None and not state["swapped"]:
+                    state["swapped"] = True
+                    _late_racer_swap(staging, "dir")
+                return pair
+
+            with mock.patch(
+                "paper_notes.deletion._open_staging_chain",
+                side_effect=swap_after_anchor,
+            ):
+                cleaned = deletion._remove_staging_dir(staging, root)
+            # explicit cleanup-required verdict (red on 178d3c3: None)
+            self.assertIs(False, cleaned)
+            # the late same-name empty-dir racer survives untouched
+            self.assertTrue(staging.is_dir())
+            self.assertFalse(staging.is_symlink())
+            self.assertEqual(sorted(os.listdir(staging)), [])
+            # the anchored original was emptied and its entry removed
+            self.assertFalse((staging.parent / f"{op_id}.racer").exists())
+            # and the residue report names the staging path
+            self.assertEqual(
+                deletion._staging_residue(staging, root),
+                (f".paper-notes/.staging/{op_id}",),
+            )
+
+    def test_late_same_name_file_racer_preserved(self):
+        """Frozen R6 v2: a REGULAR FILE racer planted at the staging
+        pathname after the anchoring is never deleted or followed; its
+        exact bytes+mode survive, the anchored original is emptied and
+        its entry removed by inode identity, and the verdict is an
+        explicit cleanup-required (red on 178d3c3 — no identity
+        protection and no clean/cleanup-required return)."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            make_vault(root)
+            op_id = "b" * 32
+            staging = root / ".paper-notes" / ".staging" / op_id
+            staging.mkdir(parents=True)
+            (staging / "snap.bin").write_bytes(b"snap-bytes")
+            real_chain = deletion._open_staging_chain
+            state = {"swapped": False}
+
+            def swap_after_anchor(vault, directory):
+                pair = real_chain(vault, directory)
+                if pair is not None and not state["swapped"]:
+                    state["swapped"] = True
+                    _late_racer_swap(staging, "file")
+                return pair
+
+            with mock.patch(
+                "paper_notes.deletion._open_staging_chain",
+                side_effect=swap_after_anchor,
+            ):
+                cleaned = deletion._remove_staging_dir(staging, root)
+            self.assertIs(False, cleaned)
+            # the racer file survives byte-identical with its mode
+            self.assertTrue(staging.is_file())
+            self.assertFalse(staging.is_symlink())
+            self.assertEqual(staging.read_bytes(), b"racer-file-bytes")
+            self.assertEqual(stat.S_IMODE(staging.lstat().st_mode), 0o640)
+            # the anchored original was emptied and its entry removed
+            self.assertFalse((staging.parent / f"{op_id}.racer").exists())
+            self.assertEqual(
+                deletion._staging_residue(staging, root),
+                (f".paper-notes/.staging/{op_id}",),
+            )
+
+    def test_late_same_name_symlink_racer_outside_sentinel_zero_writes(self):
+        """Frozen R6 v2: a SYMLINK racer pointing at an outside
+        sentinel directory planted at the staging pathname after the
+        anchoring is never followed or deleted: the outside sentinel
+        keeps its exact bytes+mode (zero outside writes), the planted
+        link stays intact, the anchored original is emptied and its
+        entry removed by inode identity, and the verdict is an
+        explicit cleanup-required (red on 178d3c3 — no identity
+        protection and no clean/cleanup-required return)."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            make_vault(root)
+            op_id = "c" * 32
+            staging = root / ".paper-notes" / ".staging" / op_id
+            staging.mkdir(parents=True)
+            (staging / "snap.bin").write_bytes(b"snap-bytes")
+            with tempfile.TemporaryDirectory() as otd:
+                outside = Path(otd)
+                sentinel = outside / "MUST_SURVIVE.txt"
+                sentinel.write_bytes(b"sentinel-bytes")
+                sentinel.chmod(0o640)
+                real_chain = deletion._open_staging_chain
+                state = {"swapped": False}
+
+                def swap_after_anchor(vault, directory):
+                    pair = real_chain(vault, directory)
+                    if pair is not None and not state["swapped"]:
+                        state["swapped"] = True
+                        _late_racer_swap(staging, "symlink", outside)
+                    return pair
+
+                with mock.patch(
+                    "paper_notes.deletion._open_staging_chain",
+                    side_effect=swap_after_anchor,
+                ):
+                    cleaned = deletion._remove_staging_dir(staging, root)
+                self.assertIs(False, cleaned)
+                # the planted link is never followed or deleted
+                self.assertTrue(staging.is_symlink())
+                self.assertEqual(os.readlink(staging), str(outside))
+                # zero outside writes: sentinel keeps exact bytes+mode
+                self.assertEqual(sentinel.read_bytes(), b"sentinel-bytes")
+                self.assertEqual(stat.S_IMODE(sentinel.lstat().st_mode), 0o640)
+                self.assertEqual(
+                    sorted(os.listdir(outside)), ["MUST_SURVIVE.txt"]
+                )
+                # the anchored original was emptied and its entry removed
+                self.assertFalse((staging.parent / f"{op_id}.racer").exists())
+                self.assertEqual(
+                    deletion._staging_residue(staging, root),
+                    (f".paper-notes/.staging/{op_id}",),
+                )
+
+    def test_retry_cleanup_late_same_name_racer_reports_residue(self):
+        """Frozen R6 v2 seam regression: through retry_cleanup, a late
+        same-name empty-directory racer (planted right after the dirfd
+        chain is anchored) is never deleted: the outcome is
+        cleanup-required with the staging path as residue and the
+        planted dir preserved untouched. Red on 178d3c3 (the pathname
+        rmdir silently destroys the racer and reports clean)."""
+        td, root, index_before, hook = self._scenario()
+        with td:
+            with mock.patch("paper_notes.deletion._remove_staging"):
+                result = confirm(root, get_token(root), hook=hook)
+            self.assertEqual(result.status, "deleted_with_cleanup_required")
+            op_id = result.operation_id
+            staging = root / ".paper-notes" / ".staging" / op_id
+            self.assertTrue(staging.is_dir())
+            real_chain = deletion._open_staging_chain
+            state = {"swapped": False}
+
+            def swap_after_anchor(vault, directory):
+                pair = real_chain(vault, directory)
+                if pair is not None and not state["swapped"]:
+                    state["swapped"] = True
+                    _late_racer_swap(staging, "dir")
+                return pair
+
+            with mock.patch(
+                "paper_notes.deletion._open_staging_chain",
+                side_effect=swap_after_anchor,
+            ):
+                outcome = deletion.retry_cleanup(root, operation_id=op_id)
+            self.assertFalse(outcome.cleaned)
+            self.assertEqual(
+                outcome.residue, (f".paper-notes/.staging/{op_id}",)
+            )
+            # the planted empty dir survives untouched
+            self.assertTrue(staging.is_dir())
+            self.assertFalse(staging.is_symlink())
+            # the anchored original's entry was removed by identity
+            self.assertFalse((staging.parent / f"{op_id}.racer").exists())
+
+    def test_remove_staging_dir_returns_explicit_clean_verdict(self):
+        """Frozen R6 v2 contract: _remove_staging_dir returns True when
+        the staging location is fully cleaned (red on 178d3c3: None),
+        the repeat is an idempotent clean, and the seam reports the
+        same cleaned outcome."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            make_vault(root)
+            op_id = "d" * 32
+            staging = root / ".paper-notes" / ".staging" / op_id
+            staging.mkdir(parents=True)
+            (staging / "snap.bin").write_bytes(b"snap-bytes")
+            self.assertIs(True, deletion._remove_staging_dir(staging, root))
+            self.assertFalse(staging.exists())
+            self.assertIs(True, deletion._remove_staging_dir(staging, root))
+            outcome = deletion.retry_cleanup(root, operation_id=op_id)
+            self.assertTrue(outcome.cleaned)
+            self.assertEqual(outcome.residue, ())
 
     def test_normal_success_with_clean_cleanup_stays_deleted(self):
         """真实（未 mock）cleanup 全部成功: 结果保持既有 'deleted'

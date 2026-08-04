@@ -68,8 +68,13 @@ Execution is one all-or-nothing transaction on the same filesystem:
    hook-time divergence fires it exactly once — the deletion itself is
    never reported 'deleted');
 8. the transaction is then finalized — only a real in-vault staging
-   directory is removed (boundary re-check, never through a symlink) —
-   and the staged operation finished. Cleanup after the linearization
+   directory is removed (boundary re-check, never through a symlink),
+   with the final entry removal identity-protected: a late same-name
+   racer (empty directory, regular file or symlink, including one
+   pointing outside the vault) that replaced the staging pathname
+   after the dirfd anchoring is never deleted or followed and is
+   reported as residue — and the staged operation finished. Cleanup
+   after the linearization
    point is best-effort: a failure, a silent no-op or leftover residue
    is reported as the structured ``deleted_with_cleanup_required``
    status (with the desensitized operation id, the exact
@@ -970,7 +975,65 @@ def _open_staging_chain(vault: Path, directory: Path) -> tuple[int, int] | None:
     return parent_fd, fd
 
 
-def _remove_staging_dir(directory: Path, vault: Path) -> None:
+def _rmdir_anchored_entry(
+    parent_fd: int, name: str, identity: tuple[int, int]
+) -> bool:
+    """Remove the anchored staging inode's directory entry from the
+    anchored parent — and only that entry.
+
+    The entry at ``name`` is verified by ``(st_dev, st_ino)`` identity
+    against the anchored inode right before the ``rmdir``: a late
+    same-name racer — an empty directory, a regular file or a symlink,
+    including one pointing outside the vault — that replaced the
+    original pathname after the chain was anchored is never deleted
+    (an empty-directory racer is never destroyed by a pathname
+    ``rmdir``), never followed, and left untouched for the caller to
+    report as residue. When the original entry was renamed away, the
+    anchored inode is located in the same parent by identity and
+    removed there; an inode the parent no longer contains cannot be
+    removed by name. Returns True when the anchored entry is gone,
+    False when the caller must report residue (the retry seam is
+    idempotent)."""
+    try:
+        st = os.lstat(name, dir_fd=parent_fd)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return False
+    else:
+        if (st.st_dev, st.st_ino) == identity:
+            try:
+                os.rmdir(name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                return True  # removed concurrently: nothing to report
+            except OSError:
+                return False  # non-empty (late entry) / busy: residue
+            return True
+        # a late same-name racer holds the name: never deleted
+    try:
+        with os.scandir(parent_fd) as it:
+            for entry in it:
+                if entry.name == name:
+                    continue  # already inspected above
+                try:
+                    st = os.lstat(entry.name, dir_fd=parent_fd)
+                except OSError:
+                    continue
+                if (st.st_dev, st.st_ino) != identity:
+                    continue
+                try:
+                    os.rmdir(entry.name, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass  # vanished: nothing of ours remains in the parent
+                except OSError:
+                    return False
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def _remove_staging_dir(directory: Path, vault: Path) -> bool:
     """Best-effort removal of a staging directory, anchored to
     directory file descriptors.
 
@@ -980,30 +1043,50 @@ def _remove_staging_dir(directory: Path, vault: Path) -> None:
     deleted with fd-relative operations only: a parent renamed away or
     swapped to an outside symlink after the anchoring can never
     redirect any deletion outside the vault, and only the anchored
-    original inodes can be removed. A symlink or non-directory
+    original inode can be removed. The final removal of the anchored
+    inode's parent entry is identity-protected: the entry at the
+    staging pathname is verified by inode identity right before the
+    ``rmdir``, so a late same-name racer — an empty directory, a
+    regular file or a symlink, including one pointing outside the
+    vault, planted after the chain was anchored — is never deleted
+    (an empty-directory racer is never destroyed by a pathname
+    ``rmdir``), never followed, and left untouched. When the original
+    entry was renamed away, the anchored inode is located in the same
+    parent by identity and removed there. A symlink or non-directory
     anywhere in the chain (including the staging path itself), or a
     type swap under an anchored directory, fails closed and is left
     untouched and reported by :func:`_staging_residue` instead.
-    Removal failures are swallowed — the residue check that follows is
-    the source of truth (a failed deletion of transaction material
-    must never fail an already-effective deletion)."""
+
+    Returns True when the anchored staging entry is fully removed and
+    nothing remains at the staging pathname inside the anchored parent;
+    False when residue is still present (a late same-name racer, a
+    leftover entry that could not be removed, or a compromised chain)
+    — the caller reports it, and the idempotent retry seam can
+    continue. Removal failures are swallowed — the residue check that
+    follows is the source of truth (a failed deletion of transaction
+    material must never fail an already-effective deletion)."""
     pair = _open_staging_chain(vault, directory)
     if pair is None:
-        return  # symlink / non-directory / missing in the chain: residue
+        return not _staging_residue(directory, vault)
     parent_fd, fd = pair
     try:
+        st = os.fstat(fd)
+        identity = (st.st_dev, st.st_ino)
         try:
             _rmtree_fd(fd)
         finally:
             os.close(fd)
+        removed = _rmdir_anchored_entry(parent_fd, directory.name, identity)
         try:
-            os.rmdir(directory.name, dir_fd=parent_fd)
+            os.lstat(directory.name, dir_fd=parent_fd)
+            present = True  # a same-name entry still blocks the pathname
         except FileNotFoundError:
-            pass  # already gone
+            present = False
         except OSError:
-            pass  # non-empty (concurrent late entry) / swapped: residue
+            present = True  # cannot verify: fail closed
     finally:
         os.close(parent_fd)
+    return removed and not present
 
 
 def _staging_residue(directory: Path, vault: Path) -> tuple[str, ...]:
@@ -1052,7 +1135,12 @@ def retry_cleanup(vault_root: str | Path, *, operation_id: str) -> CleanupOutcom
     after the anchoring can never redirect it): a symlink or
     non-directory planted at the staging path or its ``.staging``
     parent is left untouched and reported as residue — nothing
-    external is ever written, deleted or overwritten. Re-running is a
+    external is ever written, deleted or overwritten. The final
+    removal of the staging entry is inode-identity protected: a late
+    same-name racer (empty directory, regular file or symlink) that
+    replaced the pathname after the anchoring is never deleted or
+    followed and is reported as residue, and the anchored original's
+    entry is removed by identity even after a rename. Re-running is a
     safe no-op when nothing remains (the same ``cleaned`` outcome).
     The already-effective deletion and the published indexes are never
     rolled back or rewritten by this function.
