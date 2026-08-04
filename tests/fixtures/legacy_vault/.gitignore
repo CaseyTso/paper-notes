@@ -1,0 +1,3 @@
+# Fixture PDFs are migration-discovery test inputs; they must be
+# tracked even though the repository root ignores *.pdf.
+!*.pdf

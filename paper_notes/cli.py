@@ -269,6 +269,40 @@ def build_parser(json_mode: bool) -> _JsonAwareArgumentParser:
         help="write the imported key after explicit confirmation",
     )
     import_parser.set_defaults(func=_cmd_config_easyscholar_import)
+
+    migrate_parser = subparsers.add_parser(
+        "migrate",
+        help="plan or apply legacy Obsidian migrations",
+        json_mode=json_mode,
+    )
+    migrate_parser.set_defaults(func=_cmd_migrate_root)
+    migrate_subparsers = migrate_parser.add_subparsers(dest="migrate_command")
+    legacy_parser = migrate_subparsers.add_parser(
+        "legacy-obsidian",
+        help="discover legacy items and build a migration plan (read-only)",
+        json_mode=json_mode,
+    )
+    legacy_parser.add_argument(
+        "--vault", required=True, help="vault root directory"
+    )
+    legacy_parser.add_argument(
+        "--keys",
+        help="comma-separated citation keys or directory names to migrate",
+    )
+    legacy_parser.add_argument(
+        "--keys-file", help="file with one key or directory name per line"
+    )
+    legacy_parser.add_argument(
+        "--state-root",
+        help="state root for manifests/backups "
+        "(default: ~/Library/Application Support/paper-notes/migrations)",
+    )
+    legacy_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="build the plan and confirmation token without writing to the vault",
+    )
+    legacy_parser.set_defaults(func=_cmd_migrate_legacy_obsidian)
     return parser
 
 
@@ -365,6 +399,55 @@ def _cmd_config_root(args: argparse.Namespace) -> Envelope:
 
 def _cmd_config_easyscholar_root(args: argparse.Namespace) -> Envelope:
     raise UserError("missing easyscholar subcommand: use import-zotero")
+
+
+def _cmd_migrate_root(args: argparse.Namespace) -> Envelope:
+    raise UserError("missing migrate subcommand: use legacy-obsidian")
+
+
+def _cmd_migrate_legacy_obsidian(args: argparse.Namespace) -> Envelope:
+    from .migration import build_migration_plan, default_state_root
+
+    if not args.dry_run:
+        raise UserError(
+            "migrate legacy-obsidian requires --dry-run in this release; "
+            "--apply arrives with the apply engine (Task 18)"
+        )
+    if args.keys and args.keys_file:
+        raise UserError("cannot combine --keys with --keys-file")
+    keys: list[str] | None = None
+    if args.keys:
+        keys = [part.strip() for part in args.keys.split(",") if part.strip()]
+    elif args.keys_file:
+        try:
+            keys = [
+                line.strip()
+                for line in Path(args.keys_file).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        except OSError as exc:
+            raise UserError(f"cannot read keys file {args.keys_file}: {exc}") from exc
+    state_root = (
+        Path(args.state_root) if args.state_root else default_state_root()
+    )
+    plan = build_migration_plan(
+        Path(args.vault), keys=keys, state_root=state_root
+    )
+    return needs_confirmation(
+        {
+            "action": "migrate_legacy_obsidian",
+            "run_id": plan.run_id,
+            "confirmation_token": plan.confirmation_token,
+            "state_root": str(plan.state_root),
+            "manifest_path": str(plan.manifest_path),
+            "items": list(plan.items),
+            "diagnostics": plan.diagnostics,
+            "writes": {
+                "vault_writes": 0,
+                "state_root": str(plan.state_root),
+            },
+        }
+    )
 
 
 def _cmd_config_easyscholar_import(args: argparse.Namespace) -> Envelope:
