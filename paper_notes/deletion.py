@@ -848,18 +848,162 @@ def _recovery_candidates(op: fsops.StagedOperation, rel: Path):
         yield dest
 
 
-def _remove_staging_dir(directory: Path, vault: Path) -> None:
-    """Best-effort removal of a staging directory.
+def _open_dir_chain_fd(vault: Path, directory: Path) -> int | None:
+    """Open ``directory`` as an ``O_NOFOLLOW`` directory fd, anchored
+    at the vault root.
 
-    Only a real directory chain from the vault root down is removed
-    (lstat boundary re-check, never through a symlink, never outside
-    the vault): a symlink or non-directory planted anywhere in the
-    chain is left untouched and reported by :func:`_staging_residue`
-    instead. Removal failures are swallowed — the residue check that
-    follows is the source of truth (a failed deletion of transaction
-    material must never fail an already-effective deletion)."""
-    if _real_dir_chain(directory, vault):
-        shutil.rmtree(directory, ignore_errors=True)
+    Every component from the vault root down is opened with
+    ``openat(O_NOFOLLOW|O_DIRECTORY)`` relative to the previously
+    opened parent fd: a symlink, non-directory or missing component
+    anywhere in the chain fails closed (``None``) and the returned fd
+    pins the original inode — a later rename or swap of any pathname
+    component cannot redirect fd-relative operations outside the
+    vault. ``directory`` must lie strictly inside ``vault`` (the vault
+    root itself is never a cleanup target)."""
+    try:
+        rel = directory.relative_to(vault)
+    except ValueError:
+        return None
+    if not rel.parts:
+        return None
+    try:
+        fd = os.open(vault.resolve(), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        for comp in rel.parts:
+            child = os.open(
+                comp, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd
+            )
+            os.close(fd)
+            fd = child
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return None
+    return fd
+
+
+def _rmtree_fd(fd: int) -> bool:
+    """Recursively delete every entry of the anchored directory ``fd``.
+
+    Only fd-relative operations are used (``os.scandir``/``os.lstat``/
+    ``os.unlink``/``os.rmdir``/``os.open`` with ``dir_fd``), so a
+    parent renamed away or swapped to an outside symlink after ``fd``
+    was opened can never redirect a deletion outside the vault — the
+    fd pins the original inode and symlinks are never followed (a
+    symlink entry is removed as the link itself, its target is never
+    touched). Type swaps fail closed: a directory that is no longer an
+    ``O_NOFOLLOW`` directory when opened, or an entry that cannot be
+    unlinked/rmdir'ed (e.g. a concurrent late entry), is left in place
+    and reported. Returns True when the directory is empty; False when
+    any residue remains (the caller reports it; a later retry can
+    continue the partial cleanup)."""
+    try:
+        with os.scandir(fd) as it:
+            names = [e.name for e in it]
+    except OSError:
+        return False
+    clean = True
+    for name in names:
+        try:
+            st = os.lstat(name, dir_fd=fd)
+        except FileNotFoundError:
+            continue  # vanished: nothing to remove
+        except OSError:
+            clean = False
+            continue
+        if stat.S_ISDIR(st.st_mode):
+            try:
+                child = os.open(
+                    name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd
+                )
+            except OSError:
+                clean = False  # swapped to symlink/non-directory: fail closed
+                continue
+            try:
+                if not _rmtree_fd(child):
+                    clean = False
+            finally:
+                os.close(child)
+            try:
+                os.rmdir(name, dir_fd=fd)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                clean = False  # non-empty (concurrent late entry) / busy
+            continue
+        try:
+            os.unlink(name, dir_fd=fd)  # the link itself only; never follows
+        except FileNotFoundError:
+            pass
+        except OSError:
+            clean = False
+    return clean
+
+
+def _open_staging_chain(vault: Path, directory: Path) -> tuple[int, int] | None:
+    """Open the staging directory and its parent as a pair of
+    ``O_NOFOLLOW`` directory fds anchored at the vault root.
+
+    The parent chain is opened first, then the staging directory
+    itself is opened relative to the parent fd — so the final ``rmdir``
+    can run through the anchored parent fd even after the ``.staging``
+    pathname was renamed away or swapped to an outside symlink: only
+    the anchored original inodes can be removed, the swapped symlink is
+    never followed or deleted. ``None`` on any symlink, non-directory
+    or missing component (fail closed)."""
+    parent_fd = _open_dir_chain_fd(vault, directory.parent)
+    if parent_fd is None:
+        return None
+    try:
+        fd = os.open(
+            directory.name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+    except OSError:
+        os.close(parent_fd)
+        return None
+    return parent_fd, fd
+
+
+def _remove_staging_dir(directory: Path, vault: Path) -> None:
+    """Best-effort removal of a staging directory, anchored to
+    directory file descriptors.
+
+    The staging directory and its parent are opened as ``O_NOFOLLOW``
+    directory fds, component by component from the vault root (never
+    through a symlink, never outside the vault) and its contents are
+    deleted with fd-relative operations only: a parent renamed away or
+    swapped to an outside symlink after the anchoring can never
+    redirect any deletion outside the vault, and only the anchored
+    original inodes can be removed. A symlink or non-directory
+    anywhere in the chain (including the staging path itself), or a
+    type swap under an anchored directory, fails closed and is left
+    untouched and reported by :func:`_staging_residue` instead.
+    Removal failures are swallowed — the residue check that follows is
+    the source of truth (a failed deletion of transaction material
+    must never fail an already-effective deletion)."""
+    pair = _open_staging_chain(vault, directory)
+    if pair is None:
+        return  # symlink / non-directory / missing in the chain: residue
+    parent_fd, fd = pair
+    try:
+        try:
+            _rmtree_fd(fd)
+        finally:
+            os.close(fd)
+        try:
+            os.rmdir(directory.name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass  # already gone
+        except OSError:
+            pass  # non-empty (concurrent late entry) / swapped: residue
+    finally:
+        os.close(parent_fd)
 
 
 def _staging_residue(directory: Path, vault: Path) -> tuple[str, ...]:
@@ -901,8 +1045,11 @@ def retry_cleanup(vault_root: str | Path, *, operation_id: str) -> CleanupOutcom
 
     Removes the leftover staging directory
     ``.paper-notes/.staging/<operation_id>`` only when every path
-    component from the vault root down is a real directory (lstat,
-    never through a symlink, never outside the vault): a symlink or
+    component from the vault root down can be opened as a real
+    directory, anchored as ``O_NOFOLLOW`` directory fds (never through
+    a symlink, never outside the vault; the deletion itself uses only
+    fd-relative operations, so a parent swapped to an outside symlink
+    after the anchoring can never redirect it): a symlink or
     non-directory planted at the staging path or its ``.staging``
     parent is left untouched and reported as residue — nothing
     external is ever written, deleted or overwritten. Re-running is a

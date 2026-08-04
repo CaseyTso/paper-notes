@@ -1904,22 +1904,27 @@ class CleanupFailureTest(unittest.TestCase):
             self._assert_published(root, index_before)
 
     def test_partial_cleanup_residue_returns_cleanup_required(self):
-        """部分清理（rmtree 删掉内容但留下目录本身）: 残留检测必须发现
-        目录仍在并返回 deleted_with_cleanup_required."""
+        """部分清理（fd 锚定递归删除删掉内容但留下目录本身）: 残留检测
+        必须发现目录仍在并返回 deleted_with_cleanup_required.
+
+        (R6 seam change: the injection moved from the pathname
+        ``shutil.rmtree`` to the fd-anchored ``_rmtree_fd`` — the
+        assertions are unchanged.)"""
         td, root, index_before, hook = self._scenario()
-        real_rmtree = shutil.rmtree
         with td:
-            def partial_rmtree(directory, **kwargs):
-                directory = Path(directory)
-                if not directory.exists():
-                    return  # fsops.commit's throwaway verdict dir never exists
-                for child in directory.iterdir():
-                    if child.is_dir():
-                        real_rmtree(child, ignore_errors=True)
-                    else:
-                        child.unlink()
+            def partial_cleanup(fd):
+                # remove every entry except the last one: the staging
+                # directory itself must survive as the residue
+                with os.scandir(fd) as it:
+                    names = [e.name for e in it]
+                for name in names[:-1]:
+                    try:
+                        os.unlink(name, dir_fd=fd)
+                    except OSError:
+                        pass
+                return False
             with mock.patch(
-                "paper_notes.deletion.shutil.rmtree", side_effect=partial_rmtree
+                "paper_notes.deletion._rmtree_fd", side_effect=partial_cleanup
             ):
                 result = confirm(root, get_token(root), hook=hook)
             self.assertEqual(result.status, "deleted_with_cleanup_required")
@@ -2022,6 +2027,389 @@ class CleanupFailureTest(unittest.TestCase):
                 self.assertTrue(staging_parent.is_symlink())
                 self.assertEqual(os.readlink(staging_parent), str(outside))
                 self.assertEqual(sorted(os.listdir(outside)), [])
+
+    def test_retry_cleanup_staging_swap_after_check_zero_outside_writes(self):
+        """Frozen R6 race (manager repro): ``.staging`` is atomically
+        renamed away and replaced with a symlink to an outside
+        directory AFTER the real-dir-chain check returns true but
+        BEFORE the pathname rmtree. Red on 55cf784 (the pathname
+        rmtree follows the symlink and deletes outside/<opid>/ with
+        its MUST_SURVIVE.txt sentinel); the dirfd-anchored cleanup
+        keeps the outside directory byte-identical and zero-write and
+        never follows the planted symlink."""
+        td, root, index_before, hook = self._scenario()
+        with tempfile.TemporaryDirectory() as otd:
+            outside = Path(otd)
+            with td:
+                with mock.patch("paper_notes.deletion._remove_staging"):
+                    result = confirm(root, get_token(root), hook=hook)
+                self.assertEqual(result.status, "deleted_with_cleanup_required")
+                op_id = result.operation_id
+                outside_op = outside / op_id
+                outside_op.mkdir()
+                sentinel = outside_op / "MUST_SURVIVE.txt"
+                sentinel.write_bytes(b"sentinel-bytes")
+                sentinel.chmod(0o640)
+                staging_parent = root / ".paper-notes" / ".staging"
+                real_chain = deletion._real_dir_chain
+                state = {"swapped": False}
+
+                def swap_on_true(p, vault):
+                    ok = real_chain(p, vault)
+                    if ok and not state["swapped"]:
+                        state["swapped"] = True
+                        os.replace(
+                            staging_parent,
+                            staging_parent.parent / ".staging.real",
+                        )
+                        staging_parent.symlink_to(outside, target_is_directory=True)
+                    return ok
+
+                with mock.patch(
+                    "paper_notes.deletion._real_dir_chain",
+                    side_effect=swap_on_true,
+                ):
+                    outcome = deletion.retry_cleanup(root, operation_id=op_id)
+                # outside: zero writes, sentinel keeps exact bytes+mode
+                self.assertEqual(sentinel.read_bytes(), b"sentinel-bytes")
+                self.assertEqual(
+                    stat.S_IMODE(sentinel.lstat().st_mode), 0o640
+                )
+                self.assertEqual(sorted(os.listdir(outside)), [op_id])
+                self.assertEqual(
+                    sorted(os.listdir(outside_op)), ["MUST_SURVIVE.txt"]
+                )
+                # the original vault staging residue was safely cleaned
+                # (anchored) — never followed through the swapped parent
+                self.assertTrue(outcome.cleaned)
+                self.assertEqual(outcome.residue, ())
+                self.assertFalse(
+                    (root / ".paper-notes" / ".staging.real" / op_id).exists()
+                )
+
+    def test_retry_cleanup_staging_swap_after_anchor_zero_outside_writes(self):
+        """Frozen R6 deep race: ``.staging`` is swapped to an outside
+        symlink AFTER the dirfd chain is already anchored. The
+        anchored recursive delete may only touch the original vault
+        inode: outside stays byte-identical (MUST_SURVIVE.txt
+        bytes+mode), zero outside writes, the symlink is never
+        followed or deleted, and the residue is reported — never a
+        silent clean while external state stays visible through the
+        swapped parent. (Reverse validation: reverting to a pathname
+        ``shutil.rmtree`` after the anchor makes this test red.)"""
+        td, root, index_before, hook = self._scenario()
+        with tempfile.TemporaryDirectory() as otd:
+            outside = Path(otd)
+            with td:
+                with mock.patch("paper_notes.deletion._remove_staging"):
+                    result = confirm(root, get_token(root), hook=hook)
+                self.assertEqual(result.status, "deleted_with_cleanup_required")
+                op_id = result.operation_id
+                outside_op = outside / op_id
+                outside_op.mkdir()
+                sentinel = outside_op / "MUST_SURVIVE.txt"
+                sentinel.write_bytes(b"sentinel-bytes")
+                sentinel.chmod(0o640)
+                staging_parent = root / ".paper-notes" / ".staging"
+                real_open = deletion._open_dir_chain_fd
+                state = {"swapped": False}
+
+                def swap_after_anchor(vault, directory):
+                    fd = real_open(vault, directory)
+                    if fd is not None and not state["swapped"]:
+                        state["swapped"] = True
+                        os.replace(
+                            staging_parent,
+                            staging_parent.parent / ".staging.real",
+                        )
+                        staging_parent.symlink_to(outside, target_is_directory=True)
+                    return fd
+
+                with mock.patch(
+                    "paper_notes.deletion._open_dir_chain_fd",
+                    side_effect=swap_after_anchor,
+                ):
+                    outcome = deletion.retry_cleanup(root, operation_id=op_id)
+                self.assertEqual(sentinel.read_bytes(), b"sentinel-bytes")
+                self.assertEqual(
+                    stat.S_IMODE(sentinel.lstat().st_mode), 0o640
+                )
+                self.assertEqual(sorted(os.listdir(outside)), [op_id])
+                self.assertEqual(
+                    sorted(os.listdir(outside_op)), ["MUST_SURVIVE.txt"]
+                )
+                # the swapped parent symlink is never followed or deleted
+                self.assertTrue(staging_parent.is_symlink())
+                self.assertEqual(os.readlink(staging_parent), str(outside))
+                # the original vault staging residue was safely cleaned
+                self.assertFalse(
+                    (root / ".paper-notes" / ".staging.real" / op_id).exists()
+                )
+                # residue is explicitly reported — external state visible
+                # through the swapped parent is never a silent clean
+                self.assertFalse(outcome.cleaned)
+                self.assertEqual(
+                    outcome.residue, (f".paper-notes/.staging/{op_id}",)
+                )
+
+    def test_retry_cleanup_midlevel_dir_to_symlink_swap_zero_outside_writes(self):
+        """Frozen R6: a mid-level staging directory swapped to an
+        outside symlink during the recursive delete is removed as the
+        link itself (never followed): outside keeps its sentinel
+        bytes+mode, zero outside writes, and the cleanup completes
+        with the moved-aside original directory preserved."""
+        td, root, index_before, hook = self._scenario()
+        with tempfile.TemporaryDirectory() as otd:
+            outside = Path(otd)
+            with td:
+                with mock.patch("paper_notes.deletion._remove_staging"):
+                    result = confirm(root, get_token(root), hook=hook)
+                self.assertEqual(result.status, "deleted_with_cleanup_required")
+                op_id = result.operation_id
+                sentinel = outside / "keep.txt"
+                sentinel.write_bytes(b"outside-bytes")
+                sentinel.chmod(0o600)
+                staging = root / ".paper-notes" / ".staging" / op_id
+                sub = staging / "sub"
+                sub.mkdir()
+                (sub / "inner.txt").write_text("inner")
+                real_rmtree = deletion._rmtree_fd
+                state = {"swapped": False}
+
+                def swap_sub_then_real(fd):
+                    if not state["swapped"]:
+                        state["swapped"] = True
+                        os.replace(sub, root / ".paper-notes" / "sub.real")
+                        sub.symlink_to(outside, target_is_directory=True)
+                    return real_rmtree(fd)
+
+                with mock.patch(
+                    "paper_notes.deletion._rmtree_fd",
+                    side_effect=swap_sub_then_real,
+                ):
+                    outcome = deletion.retry_cleanup(root, operation_id=op_id)
+                self.assertTrue(outcome.cleaned)
+                self.assertEqual(outcome.residue, ())
+                self.assertFalse(staging.exists())
+                self.assertFalse(sub.is_symlink())
+                self.assertEqual(
+                    (root / ".paper-notes" / "sub.real" / "inner.txt").read_text(),
+                    "inner",
+                )
+                self.assertEqual(sentinel.read_bytes(), b"outside-bytes")
+                self.assertEqual(
+                    stat.S_IMODE(sentinel.lstat().st_mode), 0o600
+                )
+                self.assertEqual(sorted(os.listdir(outside)), ["keep.txt"])
+
+    def test_retry_cleanup_midlevel_swap_between_stat_and_open_fails_closed(self):
+        """Frozen R6: a mid-level directory swapped to an outside
+        symlink BETWEEN its lstat and its O_NOFOLLOW directory open
+        fails closed: the symlink is left untouched and reported as
+        residue, outside receives zero writes; the retry removes the
+        link itself and completes."""
+        td, root, index_before, hook = self._scenario()
+        with tempfile.TemporaryDirectory() as otd:
+            outside = Path(otd)
+            with td:
+                with mock.patch("paper_notes.deletion._remove_staging"):
+                    result = confirm(root, get_token(root), hook=hook)
+                self.assertEqual(result.status, "deleted_with_cleanup_required")
+                op_id = result.operation_id
+                sentinel = outside / "keep.txt"
+                sentinel.write_bytes(b"outside-bytes")
+                sentinel.chmod(0o600)
+                staging = root / ".paper-notes" / ".staging" / op_id
+                sub = staging / "sub"
+                sub.mkdir()
+                (sub / "inner.txt").write_text("inner")
+                real_open = os.open
+                state = {"swapped": False}
+
+                def swap_before_open(name, flags, mode=0o777, *, dir_fd=None):
+                    if name == "sub" and not state["swapped"]:
+                        state["swapped"] = True
+                        os.replace(sub, root / ".paper-notes" / "sub.real")
+                        sub.symlink_to(outside, target_is_directory=True)
+                    return real_open(name, flags, mode, dir_fd=dir_fd)
+
+                with mock.patch(
+                    "paper_notes.deletion.os.open", side_effect=swap_before_open
+                ):
+                    outcome = deletion.retry_cleanup(root, operation_id=op_id)
+                # fail closed: the swapped link is untouched, reported
+                self.assertFalse(outcome.cleaned)
+                self.assertEqual(
+                    outcome.residue, (f".paper-notes/.staging/{op_id}",)
+                )
+                self.assertTrue(sub.is_symlink())
+                self.assertEqual(os.readlink(sub), str(outside))
+                self.assertEqual(sentinel.read_bytes(), b"outside-bytes")
+                self.assertEqual(
+                    stat.S_IMODE(sentinel.lstat().st_mode), 0o600
+                )
+                self.assertEqual(sorted(os.listdir(outside)), ["keep.txt"])
+                # the retry removes the link itself and completes
+                again = deletion.retry_cleanup(root, operation_id=op_id)
+                self.assertTrue(again.cleaned)
+                self.assertEqual(again.residue, ())
+
+    def test_retry_cleanup_midlevel_dir_to_file_swap(self):
+        """Frozen R6: a mid-level staging directory swapped to a
+        regular file during the recursive delete is removed as the
+        entry itself (an anchored vault inode) — deterministic and
+        zero outside involvement; the moved-aside original directory
+        survives untouched."""
+        td, root, index_before, hook = self._scenario()
+        with td:
+            with mock.patch("paper_notes.deletion._remove_staging"):
+                result = confirm(root, get_token(root), hook=hook)
+            self.assertEqual(result.status, "deleted_with_cleanup_required")
+            op_id = result.operation_id
+            staging = root / ".paper-notes" / ".staging" / op_id
+            sub = staging / "sub"
+            sub.mkdir()
+            (sub / "inner.txt").write_text("inner")
+            real_rmtree = deletion._rmtree_fd
+            state = {"swapped": False}
+
+            def swap_sub_then_real(fd):
+                if not state["swapped"]:
+                    state["swapped"] = True
+                    os.replace(sub, root / ".paper-notes" / "sub.real")
+                    sub.write_text("racer-file")
+                return real_rmtree(fd)
+
+            with mock.patch(
+                "paper_notes.deletion._rmtree_fd",
+                side_effect=swap_sub_then_real,
+            ):
+                outcome = deletion.retry_cleanup(root, operation_id=op_id)
+            self.assertTrue(outcome.cleaned)
+            self.assertEqual(outcome.residue, ())
+            self.assertFalse(sub.exists())
+            self.assertEqual(
+                (root / ".paper-notes" / "sub.real" / "inner.txt").read_text(),
+                "inner",
+            )
+
+    def test_retry_cleanup_concurrent_late_entry_reported_as_residue(self):
+        """Frozen R6: a file appearing inside the staging directory
+        after its contents were deleted but before its rmdir (a
+        concurrent late entry) fails the rmdir (ENOTEMPTY): the entry
+        is preserved untouched, the residue is reported, and the retry
+        completes. Red on 55cf784 (the pathname rmtree never goes
+        through this seam — the plant never triggers and the cleanup
+        is silently reported clean)."""
+        td, root, index_before, hook = self._scenario()
+        with td:
+            with mock.patch("paper_notes.deletion._remove_staging"):
+                result = confirm(root, get_token(root), hook=hook)
+            self.assertEqual(result.status, "deleted_with_cleanup_required")
+            op_id = result.operation_id
+            staging = root / ".paper-notes" / ".staging" / op_id
+            real_rmdir = os.rmdir
+            state = {"planted": False}
+
+            def late_entry_rmdir(name, *, dir_fd=None):
+                if name == op_id and not state["planted"]:
+                    state["planted"] = True
+                    (staging / "late.txt").write_text("racer")
+                return real_rmdir(name, dir_fd=dir_fd)
+
+            with mock.patch(
+                "paper_notes.deletion.os.rmdir", side_effect=late_entry_rmdir
+            ):
+                outcome = deletion.retry_cleanup(root, operation_id=op_id)
+            self.assertFalse(outcome.cleaned)
+            self.assertEqual(
+                outcome.residue, (f".paper-notes/.staging/{op_id}",)
+            )
+            self.assertEqual((staging / "late.txt").read_text(), "racer")
+            # retry without the race completes
+            again = deletion.retry_cleanup(root, operation_id=op_id)
+            self.assertTrue(again.cleaned)
+            self.assertEqual(again.residue, ())
+
+    def test_retry_cleanup_partial_residue_retry_cleans(self):
+        """Partial deletion (a non-writable subdirectory blocks the
+        removal of its file): residue is reported with the blocked
+        file preserved byte-identical; after restoring permissions the
+        retry completes — real filesystem, no mocks."""
+        td, root, index_before, hook = self._scenario()
+        with td:
+            with mock.patch("paper_notes.deletion._remove_staging"):
+                result = confirm(root, get_token(root), hook=hook)
+            self.assertEqual(result.status, "deleted_with_cleanup_required")
+            op_id = result.operation_id
+            staging = root / ".paper-notes" / ".staging" / op_id
+            blocked = staging / "blocked"
+            blocked.mkdir()
+            payload = blocked / "payload.txt"
+            payload.write_bytes(b"blocked-bytes")
+            payload.chmod(0o600)
+            blocked.chmod(0o555)
+            try:
+                outcome = deletion.retry_cleanup(root, operation_id=op_id)
+                self.assertFalse(outcome.cleaned)
+                self.assertEqual(
+                    outcome.residue, (f".paper-notes/.staging/{op_id}",)
+                )
+                self.assertEqual(payload.read_bytes(), b"blocked-bytes")
+                self.assertEqual(
+                    stat.S_IMODE(payload.lstat().st_mode), 0o600
+                )
+                # restore permissions: the retry completes
+                blocked.chmod(0o755)
+                again = deletion.retry_cleanup(root, operation_id=op_id)
+                self.assertTrue(again.cleaned)
+                self.assertEqual(again.residue, ())
+            finally:
+                # restore permissions for fixture cleanup; the retry
+                # above may already have removed the directory
+                try:
+                    blocked.chmod(0o755)
+                except FileNotFoundError:
+                    pass
+
+    def test_retry_cleanup_removes_deep_tree_and_entry_symlinks(self):
+        """Deep nested directories and an entry symlink pointing at an
+        outside directory: the recursive anchored delete removes the
+        whole tree and the link itself (never followed) — outside
+        keeps its sentinel bytes+mode, zero outside writes, cleaned;
+        idempotent repeat."""
+        td, root, index_before, hook = self._scenario()
+        with tempfile.TemporaryDirectory() as otd:
+            outside = Path(otd)
+            with td:
+                with mock.patch("paper_notes.deletion._remove_staging"):
+                    result = confirm(root, get_token(root), hook=hook)
+                self.assertEqual(result.status, "deleted_with_cleanup_required")
+                op_id = result.operation_id
+                sentinel = outside / "keep.txt"
+                sentinel.write_bytes(b"outside-bytes")
+                sentinel.chmod(0o600)
+                staging = root / ".paper-notes" / ".staging" / op_id
+                deep = staging / "a" / "b" / "c"
+                deep.mkdir(parents=True)
+                (deep / "deep.txt").write_bytes(b"deep-bytes")
+                (staging / "escape_link").symlink_to(
+                    outside, target_is_directory=True
+                )
+                outcome = deletion.retry_cleanup(root, operation_id=op_id)
+                self.assertTrue(outcome.cleaned)
+                self.assertEqual(outcome.residue, ())
+                self.assertFalse(staging.exists())
+                self.assertFalse((staging / "escape_link").exists())
+                self.assertEqual(sentinel.read_bytes(), b"outside-bytes")
+                self.assertEqual(
+                    stat.S_IMODE(sentinel.lstat().st_mode), 0o600
+                )
+                self.assertEqual(sorted(os.listdir(outside)), ["keep.txt"])
+                # idempotent repeat
+                again = deletion.retry_cleanup(root, operation_id=op_id)
+                self.assertTrue(again.cleaned)
+                self.assertEqual(again.residue, ())
 
     def test_normal_success_with_clean_cleanup_stays_deleted(self):
         """真实（未 mock）cleanup 全部成功: 结果保持既有 'deleted'
