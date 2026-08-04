@@ -14,7 +14,7 @@ import traceback
 from pathlib import Path
 from typing import Any, NoReturn
 
-from . import __version__, attachments, citations, csl, deletion, items
+from . import __version__, attachments, citations, config, csl, deletion, items
 from .identifiers import extract_identifiers, parse_arxiv, parse_doi, parse_pmcid, parse_pmid
 from .protocol import (
     EXIT_CONFLICT,
@@ -26,6 +26,7 @@ from .protocol import (
     conflict,
     error,
     exit_code_for,
+    needs_confirmation,
     success,
 )
 
@@ -217,6 +218,57 @@ def build_parser(json_mode: bool) -> _JsonAwareArgumentParser:
         "--input", required=True, help="manuscript Markdown file"
     )
     validate_parser.set_defaults(func=_cmd_index_validate)
+
+    metrics_parser = subparsers.add_parser(
+        "metrics",
+        help="query volatile journal metrics (EasyScholar; never writes to Markdown)",
+        json_mode=json_mode,
+    )
+    metrics_parser.set_defaults(func=_cmd_metrics_root)
+    metrics_subparsers = metrics_parser.add_subparsers(dest="metrics_command")
+    query_parser = metrics_subparsers.add_parser(
+        "query",
+        help="query and normalize journal metrics",
+        json_mode=json_mode,
+    )
+    query_parser.add_argument("--journal", help="journal name")
+    query_parser.add_argument("--issn", help="journal ISSN")
+    query_parser.set_defaults(func=_cmd_metrics_query)
+
+    config_parser = subparsers.add_parser(
+        "config",
+        help="private configuration (secrets stay outside the vault)",
+        json_mode=json_mode,
+    )
+    config_parser.set_defaults(func=_cmd_config_root)
+    config_subparsers = config_parser.add_subparsers(dest="config_command")
+    es_parser = config_subparsers.add_parser(
+        "easyscholar",
+        help="EasyScholar private settings",
+        json_mode=json_mode,
+    )
+    es_parser.set_defaults(func=_cmd_config_easyscholar_root)
+    es_subparsers = es_parser.add_subparsers(dest="easyscholar_command")
+    import_parser = es_subparsers.add_parser(
+        "import-zotero",
+        help="import the SecretKey from Zotero preferences (never printed)",
+        json_mode=json_mode,
+    )
+    import_parser.add_argument(
+        "--prefs", help="path to Zotero prefs.js (default: Zotero data dir)"
+    )
+    import_mode = import_parser.add_mutually_exclusive_group()
+    import_mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="detect the key and report, but do not write anything",
+    )
+    import_mode.add_argument(
+        "--confirmed",
+        action="store_true",
+        help="write the imported key after explicit confirmation",
+    )
+    import_parser.set_defaults(func=_cmd_config_easyscholar_import)
     return parser
 
 
@@ -280,6 +332,76 @@ def _cmd_index_validate(args: argparse.Namespace) -> Envelope:
             "unknown": [],
         }
     )
+
+
+def _cmd_metrics_root(args: argparse.Namespace) -> Envelope:
+    raise UserError("missing metrics subcommand: use query")
+
+
+def _cmd_metrics_query(args: argparse.Namespace) -> Envelope:
+    if not args.journal and not args.issn:
+        raise UserError("metrics query requires --journal or --issn")
+    cfg = config.load_config()
+    if not cfg.easyscholar_secret_key:
+        raise UserError(
+            "no EasyScholar secret key configured; run "
+            "'paper-notes config easyscholar import-zotero --dry-run' first"
+        )
+    from .adapters import easyscholar
+
+    adapter = easyscholar.EasyScholarAdapter(cfg.easyscholar_secret_key)
+    try:
+        result = adapter.query(journal=args.journal, issn=args.issn)
+    except easyscholar.EasyScholarError as exc:
+        raise UserError(
+            config.redact_text(str(exc), cfg.easyscholar_secret_key)
+        ) from exc
+    return success({"metrics": result})
+
+
+def _cmd_config_root(args: argparse.Namespace) -> Envelope:
+    raise UserError("missing config subcommand: use easyscholar")
+
+
+def _cmd_config_easyscholar_root(args: argparse.Namespace) -> Envelope:
+    raise UserError("missing easyscholar subcommand: use import-zotero")
+
+
+def _cmd_config_easyscholar_import(args: argparse.Namespace) -> Envelope:
+    from .adapters import easyscholar
+
+    prefs_path = (
+        Path(args.prefs) if args.prefs else easyscholar.default_prefs_path()
+    )
+    try:
+        secret = easyscholar.find_secret_in_prefs(prefs_path)
+    except OSError as exc:
+        raise UserError(
+            f"cannot read Zotero preferences {prefs_path}: {exc}"
+        ) from exc
+    target = config.default_config_path()
+    data = {
+        "found": secret is not None,
+        "config_path": str(target),
+        "written": False,
+    }
+    if args.dry_run:
+        return success(data)
+    if not args.confirmed:
+        return needs_confirmation(
+            {
+                **data,
+                "reason": "run with --dry-run to preview, --confirmed to write",
+            }
+        )
+    if secret is None:
+        raise UserError(
+            "no EasyScholar secret key found in Zotero preferences"
+        )
+    config.save_config(
+        config.Config(easyscholar_secret_key=secret), path=target
+    )
+    return success({"found": True, "config_path": str(target), "written": True})
 
 
 def _load_json_file(path_text: str, what: str) -> dict[str, Any]:
