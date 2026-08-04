@@ -93,6 +93,19 @@ Contract (spec §8.3 + plan Task 14 + manager approval):
   linearization point is the success transition at the end of
   finalize: after the last expected-state authority no writable
   callback runs.
+- Repair-R5 frozen regressions (Decision A, each verified red before
+  the fix): the second final authority inside
+  IndexParticipant.finalize is the deletion's linearization point —
+  after it the item deletion and both index publications are formally
+  effective and are NEVER rolled back because of cleanup trouble.
+  Staging cleanup is best-effort; when it fails, silently no-ops or
+  leaves residue, confirm_delete returns the structured
+  deleted_with_cleanup_required status (never a silent 'deleted')
+  carrying the desensitized operation id, the exact vault-relative
+  residue paths and idempotent retry-cleanup guidance;
+  retry_cleanup() is an idempotent, vault-bound, symlink-safe retry
+  seam that never follows symlinks and never overwrites external
+  files.
 """
 
 import contextlib
@@ -1789,6 +1802,243 @@ class FinalAuthoritySeamTest(unittest.TestCase):
             self.assertFalse((root / ".paper-notes" / "write.lock").exists())
             self.assertEqual(staging_residue(root), [])
             self.assertFalse(workdir(root).exists())
+
+
+class CleanupFailureTest(unittest.TestCase):
+    """Frozen repair-R5 regressions (Decision A): the second final
+    authority inside IndexParticipant.finalize is the deletion's
+    linearization point — after it the item deletion and both index
+    publications are formally effective and are NEVER rolled back
+    because of cleanup trouble.
+
+    Staging cleanup is best-effort; when it fails, silently no-ops or
+    leaves residue, confirm_delete returns the structured
+    deleted_with_cleanup_required status (never a silent 'deleted')
+    with the desensitized operation id, the exact vault-relative
+    residue paths and idempotent retry-cleanup guidance, the item
+    stays absent and both index files keep their published new
+    bytes+mode. retry_cleanup() is idempotent, vault-bound and
+    symlink-safe: a symlink or non-directory planted at the staging
+    path or its .staging parent is never followed, deleted or
+    overwritten and is reported as residue with zero outside writes.
+    """
+
+    def _scenario(self):
+        td = tempfile.TemporaryDirectory()
+        root = Path(td.name)
+        make_vault(root)
+        index_before = seed_index(
+            root,
+            library={"papers": {OLD: PAPER_ID, OTHER: "other-uuid"}},
+            aliases={"aliases": {ALIAS: OLD, "smithAlias": "smithExample2026"}},
+        )
+        hook = mock.Mock()
+        return td, root, index_before, hook
+
+    def _assert_published(self, root, index_before):
+        lib, al = index_paths(root)
+        self.assertEqual(
+            json.loads(lib.read_text()), {"papers": {OTHER: "other-uuid"}}
+        )
+        self.assertEqual(
+            json.loads(al.read_text()),
+            {"aliases": {"smithAlias": "smithExample2026"}},
+        )
+        self.assertEqual(stat.S_IMODE(lib.lstat().st_mode), stat.S_IMODE(index_before[4]))
+        self.assertEqual(stat.S_IMODE(al.lstat().st_mode), stat.S_IMODE(index_before[5]))
+
+    def test_cleanup_noop_residue_returns_cleanup_required(self):
+        """_remove_staging 被 mock 为 no-op（静默残留）: 不得再返回
+        'deleted' — 返回结构化 deleted_with_cleanup_required；item 仍
+        absent、两 index 保持已发布新 bytes/mode、残留路径准确且脱敏
+        （vault 相对路径）、hook 恰好一次、无回滚."""
+        td, root, index_before, hook = self._scenario()
+        with td:
+            with mock.patch("paper_notes.deletion._remove_staging"):
+                result = confirm(root, get_token(root), hook=hook)
+            self.assertEqual(result.status, "deleted_with_cleanup_required")
+            self.assertEqual(result.action, "delete")
+            self.assertEqual(result.citation_key, OLD)
+            self.assertEqual(result.paper_id, PAPER_ID)
+            # operation id: generated, non-sensitive, matches the residue dir
+            self.assertRegex(result.operation_id, r"^[a-z0-9]{32}$")
+            staging = root / ".paper-notes" / ".staging" / result.operation_id
+            self.assertTrue(staging.is_dir())  # the residue is real
+            self.assertEqual(
+                result.residue, (f".paper-notes/.staging/{result.operation_id}",)
+            )
+            for entry in result.residue:
+                self.assertFalse(Path(entry).is_absolute())  # desensitized
+                self.assertTrue(entry.startswith(".paper-notes/"))
+            self.assertIn(result.operation_id, result.retry)
+            self.assertIn("retry_cleanup", result.retry)
+            # the deletion is effective and never rolled back
+            hook.assert_called_once_with()
+            self.assertFalse(item(root, OLD).exists())
+            self.assertFalse(item(root, OLD).is_symlink())
+            self.assertFalse(workdir(root).exists())
+            self.assertFalse((root / ".paper-notes" / "write.lock").exists())
+            self._assert_published(root, index_before)
+
+    def test_cleanup_exception_returns_cleanup_required(self):
+        """_remove_staging 抛异常: cleanup 不得让已生效事务失败 — 异常
+        被吞掉、残留被检测，返回 deleted_with_cleanup_required；item
+        仍 absent、两 index 保持已发布、hook 恰好一次、无回滚."""
+        td, root, index_before, hook = self._scenario()
+        with td:
+            with mock.patch(
+                "paper_notes.deletion._remove_staging",
+                side_effect=OSError("cleanup boom"),
+            ):
+                result = confirm(root, get_token(root), hook=hook)
+            self.assertEqual(result.status, "deleted_with_cleanup_required")
+            staging = root / ".paper-notes" / ".staging" / result.operation_id
+            self.assertTrue(staging.is_dir())
+            self.assertEqual(
+                result.residue, (f".paper-notes/.staging/{result.operation_id}",)
+            )
+            hook.assert_called_once_with()
+            self.assertFalse(item(root, OLD).exists())
+            self.assertFalse(workdir(root).exists())
+            self.assertFalse((root / ".paper-notes" / "write.lock").exists())
+            self._assert_published(root, index_before)
+
+    def test_partial_cleanup_residue_returns_cleanup_required(self):
+        """部分清理（rmtree 删掉内容但留下目录本身）: 残留检测必须发现
+        目录仍在并返回 deleted_with_cleanup_required."""
+        td, root, index_before, hook = self._scenario()
+        real_rmtree = shutil.rmtree
+        with td:
+            def partial_rmtree(directory, **kwargs):
+                directory = Path(directory)
+                if not directory.exists():
+                    return  # fsops.commit's throwaway verdict dir never exists
+                for child in directory.iterdir():
+                    if child.is_dir():
+                        real_rmtree(child, ignore_errors=True)
+                    else:
+                        child.unlink()
+            with mock.patch(
+                "paper_notes.deletion.shutil.rmtree", side_effect=partial_rmtree
+            ):
+                result = confirm(root, get_token(root), hook=hook)
+            self.assertEqual(result.status, "deleted_with_cleanup_required")
+            staging = root / ".paper-notes" / ".staging" / result.operation_id
+            self.assertTrue(staging.is_dir())  # partial residue
+            self.assertEqual(
+                result.residue, (f".paper-notes/.staging/{result.operation_id}",)
+            )
+            hook.assert_called_once_with()
+            self.assertFalse(item(root, OLD).exists())
+            self._assert_published(root, index_before)
+
+    def test_retry_cleanup_idempotent_clears_residue(self):
+        """retry_cleanup: 首次清理残留 → cleaned；重复调用幂等；未知
+        operation 幂等 clean；非法 operation id 拒绝（ValueError, 零
+        文件系统访问）；已生效删除与已发布 index 不受影响."""
+        td, root, index_before, hook = self._scenario()
+        with td:
+            with mock.patch("paper_notes.deletion._remove_staging"):
+                result = confirm(root, get_token(root), hook=hook)
+            self.assertEqual(result.status, "deleted_with_cleanup_required")
+            op_id = result.operation_id
+            staging = root / ".paper-notes" / ".staging" / op_id
+            self.assertTrue(staging.is_dir())
+            outcome = deletion.retry_cleanup(root, operation_id=op_id)
+            self.assertTrue(outcome.cleaned)
+            self.assertEqual(outcome.residue, ())
+            self.assertEqual(outcome.operation_id, op_id)
+            self.assertFalse(staging.exists())
+            # idempotent repeat
+            again = deletion.retry_cleanup(root, operation_id=op_id)
+            self.assertTrue(again.cleaned)
+            self.assertEqual(again.residue, ())
+            # unknown operation: clean no-op
+            unknown = deletion.retry_cleanup(root, operation_id="f" * 32)
+            self.assertTrue(unknown.cleaned)
+            self.assertEqual(unknown.residue, ())
+            # invalid operation ids are rejected before any filesystem access
+            for bad in ("../evil", "/abs/path", "has space", "UPPER", "a" * 33):
+                with self.assertRaises(ValueError):
+                    deletion.retry_cleanup(root, operation_id=bad)
+            # the effective deletion stays untouched
+            self.assertFalse(item(root, OLD).exists())
+            self.assertFalse((root / ".paper-notes" / "write.lock").exists())
+            self._assert_published(root, index_before)
+
+    def test_retry_cleanup_refuses_staging_symlink_zero_outside_writes(self):
+        """staging 路径被换成指向 vault 外目录的 symlink: retry_cleanup
+        拒绝删除（lstat 边界检查, 绝不穿越 symlink, 绝不覆盖外部文件），
+        报告该路径为残留, outside 目录零写入, symlink 原样保留; 重复
+        调用幂等."""
+        td, root, index_before, hook = self._scenario()
+        with tempfile.TemporaryDirectory() as otd:
+            outside = Path(otd)
+            with td:
+                with mock.patch("paper_notes.deletion._remove_staging"):
+                    result = confirm(root, get_token(root), hook=hook)
+                self.assertEqual(result.status, "deleted_with_cleanup_required")
+                staging = root / ".paper-notes" / ".staging" / result.operation_id
+                self.assertTrue(staging.is_dir())
+                shutil.rmtree(staging)  # remove the real dir, then plant a symlink
+                staging.symlink_to(outside, target_is_directory=True)
+                outcome = deletion.retry_cleanup(
+                    root, operation_id=result.operation_id
+                )
+                self.assertFalse(outcome.cleaned)
+                self.assertEqual(
+                    outcome.residue,
+                    (f".paper-notes/.staging/{result.operation_id}",),
+                )
+                self.assertTrue(staging.is_symlink())
+                self.assertEqual(os.readlink(staging), str(outside))
+                self.assertEqual(sorted(os.listdir(outside)), [])
+                # idempotent refusal
+                again = deletion.retry_cleanup(
+                    root, operation_id=result.operation_id
+                )
+                self.assertFalse(again.cleaned)
+                self.assertEqual(again.residue, outcome.residue)
+
+    def test_retry_cleanup_refuses_symlinked_staging_parent(self):
+        """.staging 父目录被换成指向 vault 外目录的 symlink:
+        retry_cleanup 拒绝（父链 lstat 检查失败, 零外部写入）, 报告
+        .staging 自身为残留, symlink 原样保留."""
+        td, root, index_before, hook = self._scenario()
+        with tempfile.TemporaryDirectory() as otd:
+            outside = Path(otd)
+            with td:
+                with mock.patch("paper_notes.deletion._remove_staging"):
+                    result = confirm(root, get_token(root), hook=hook)
+                self.assertEqual(result.status, "deleted_with_cleanup_required")
+                staging_parent = root / ".paper-notes" / ".staging"
+                os.replace(staging_parent, staging_parent.parent / ".staging.real")
+                staging_parent.symlink_to(outside, target_is_directory=True)
+                outcome = deletion.retry_cleanup(
+                    root, operation_id=result.operation_id
+                )
+                self.assertFalse(outcome.cleaned)
+                self.assertEqual(outcome.residue, (".paper-notes/.staging",))
+                self.assertTrue(staging_parent.is_symlink())
+                self.assertEqual(os.readlink(staging_parent), str(outside))
+                self.assertEqual(sorted(os.listdir(outside)), [])
+
+    def test_normal_success_with_clean_cleanup_stays_deleted(self):
+        """真实（未 mock）cleanup 全部成功: 结果保持既有 'deleted'
+        状态, 无残留, item absent, 两 index 已发布, 全残留清零."""
+        td, root, index_before, hook = self._scenario()
+        with td:
+            result = confirm(root, get_token(root), hook=hook)
+            self.assertEqual(result.status, "deleted")
+            self.assertRegex(result.operation_id, r"^[a-z0-9]{32}$")
+            self.assertEqual(result.residue, ())
+            self.assertEqual(result.retry, "")
+            hook.assert_called_once_with()
+            self.assertFalse(item(root, OLD).exists())
+            self.assertFalse(workdir(root).exists())
+            self.assertFalse((root / ".paper-notes" / "write.lock").exists())
+            self.assertEqual(staging_residue(root), [])
+            self._assert_published(root, index_before)
 
 
 class RecoverySeamTest(unittest.TestCase):

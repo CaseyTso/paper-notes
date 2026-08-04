@@ -59,16 +59,24 @@ Execution is one all-or-nothing transaction on the same filesystem:
    rebuild hook fires exactly once INSIDE the transaction, then a
    second full authority detects any edit/chmod/type swap the hook
    performed on a transaction target and rolls the item AND both index
-   files back, and only then is the staging directory removed and the
-   operation finished (the deletion's linearization point: after the
-   last expected-state authority no writable callback runs);
+   files back, and only then is the operation finished — the
+   deletion's linearization point: after the last expected-state
+   authority no writable callback runs and nothing can roll the
+   effective deletion back;
 7. the rebuild hook fires exactly once, and only when every authority
    is clean, so every rollback path fires the hook zero times (a
    hook-time divergence fires it exactly once — the deletion itself is
    never reported 'deleted');
 8. the transaction is then finalized — only a real in-vault staging
    directory is removed (boundary re-check, never through a symlink) —
-   and the staged operation finished.
+   and the staged operation finished. Cleanup after the linearization
+   point is best-effort: a failure, a silent no-op or leftover residue
+   is reported as the structured ``deleted_with_cleanup_required``
+   status (with the desensitized operation id, the exact
+   vault-relative residue paths and idempotent retry-cleanup guidance)
+   — never a silent ``deleted`` — and the effective deletion is never
+   rolled back. :func:`retry_cleanup` is the idempotent, vault-bound,
+   symlink-safe retry seam for that residue.
 
 On any failure the staged operation is rolled back, any removed
 directories are recreated with their recorded modes, and the restored
@@ -128,7 +136,7 @@ from .items import (
     _noop_rebuild,
     _resolve_record,
 )
-from .locking import LOCK_DIR, release_lock
+from .locking import LOCK_DIR, release_lock, validate_operation_id
 from .paths import paper_directory
 from .repository import build_index
 
@@ -137,6 +145,16 @@ DELETE_LOCK_OPERATION = "delete_item"
 _STALE_TOKEN_MESSAGE = (
     "confirmation token is stale: the vault changed since the preview; "
     "re-run item delete --dry-run"
+)
+
+_CLEANUP_RETRY_GUIDANCE = (
+    "the item deletion and both index publications succeeded, but "
+    "transaction material remains under .paper-notes/.staging/"
+    "{operation_id}; the deleted item and published indexes are final "
+    "and will not be rolled back — run "
+    "paper_notes.deletion.retry_cleanup(vault, operation_id={operation_id!r}) "
+    "(idempotent) or remove the listed residue manually after confirming "
+    "no write is in progress"
 )
 
 _WORK_SUFFIX = ".delete-work"
@@ -287,6 +305,23 @@ class DeleteResult:
     total_bytes: int
     occurrences: list[DeleteOccurrence]
     warnings: list[str]
+    # R5: recovery metadata for the post-linearization cleanup. The
+    # operation id is a generated, non-sensitive value; ``residue``
+    # holds exact vault-relative (desensitized) paths; ``retry`` is
+    # idempotent retry-cleanup guidance. All three are empty on a
+    # fully cleaned ``deleted`` result.
+    operation_id: str = ""
+    residue: tuple[str, ...] = ()
+    retry: str = ""
+
+
+@dataclass(frozen=True)
+class CleanupOutcome:
+    """Outcome of one :func:`retry_cleanup` attempt."""
+
+    operation_id: str
+    residue: tuple[str, ...]  # still present after this attempt (vault-relative)
+    cleaned: bool  # True when nothing remains
 
 
 # ---------------------------------------------------------------------------
@@ -468,6 +503,15 @@ def confirm_delete(
     external racer reappearing at a deleted path) fires it zero times,
     restores the whole item byte-for-byte, and preserves the racer at a
     named ``.paper-notes/recovery/`` location reported by the conflict.
+
+    Once the second final authority inside the participant passed (the
+    deletion's linearization point) the item deletion and both index
+    publications are effective and are never rolled back: a staging
+    cleanup that fails, silently no-ops or leaves residue surfaces as
+    the structured ``deleted_with_cleanup_required`` result (with the
+    desensitized operation id, exact vault-relative residue paths and
+    idempotent retry-cleanup guidance) instead of a silent
+    ``deleted``; :func:`retry_cleanup` is the retry seam.
     """
     root = Path(vault_root)
     hook = rebuild_hook or _noop_rebuild
@@ -486,7 +530,29 @@ def confirm_delete(
         token = _delete_token(plan)
         if not hmac.compare_digest(str(confirm_token), token):
             raise ItemConflict(_STALE_TOKEN_MESSAGE)
-        _execute(root, plan, hook)
+        operation_id, residue = _execute(root, plan, hook)
+        if residue:
+            # The deletion and both index publications are effective
+            # (the linearization point already passed) but leftover
+            # transaction material remains: never report a silent
+            # 'deleted' — surface the structured cleanup-required
+            # status with the desensitized operation id, the exact
+            # vault-relative residue paths and idempotent
+            # retry-cleanup guidance.
+            return DeleteResult(
+                status="deleted_with_cleanup_required",
+                action="delete",
+                paper_id=plan.paper_id,
+                citation_key=plan.key,
+                path=str(paper_directory(root, plan.key)),
+                file_count=plan.file_count,
+                total_bytes=plan.total_bytes,
+                occurrences=plan.occurrences,
+                warnings=plan.warnings,
+                operation_id=operation_id,
+                residue=residue,
+                retry=_CLEANUP_RETRY_GUIDANCE.format(operation_id=operation_id),
+            )
         return DeleteResult(
             status="deleted",
             action="delete",
@@ -497,6 +563,7 @@ def confirm_delete(
             total_bytes=plan.total_bytes,
             occurrences=plan.occurrences,
             warnings=plan.warnings,
+            operation_id=operation_id,
         )
     finally:
         release_lock(lock)
@@ -781,14 +848,84 @@ def _recovery_candidates(op: fsops.StagedOperation, rel: Path):
         yield dest
 
 
+def _remove_staging_dir(directory: Path, vault: Path) -> None:
+    """Best-effort removal of a staging directory.
+
+    Only a real directory chain from the vault root down is removed
+    (lstat boundary re-check, never through a symlink, never outside
+    the vault): a symlink or non-directory planted anywhere in the
+    chain is left untouched and reported by :func:`_staging_residue`
+    instead. Removal failures are swallowed — the residue check that
+    follows is the source of truth (a failed deletion of transaction
+    material must never fail an already-effective deletion)."""
+    if _real_dir_chain(directory, vault):
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def _staging_residue(directory: Path, vault: Path) -> tuple[str, ...]:
+    """Vault-relative, desensitized residue paths still present at the
+    staging location after a best-effort cleanup attempt.
+
+    ``()`` means the staging area is fully cleaned. A real directory,
+    a symlink or any other type still sitting at the staging path is
+    reported as residue; when the staging directory itself is gone but
+    its ``.staging`` parent is no longer a real directory (e.g. a
+    symlink planted there), the parent is reported instead — cleanup
+    never follows or deletes through it. The operator (or
+    :func:`retry_cleanup`) decides how to remove the residue; the
+    deleted item and the published indexes are final and are never
+    rolled back because of leftover transaction material."""
+    if directory.exists() or directory.is_symlink():
+        return (str(directory.relative_to(vault)),)
+    parent = directory.parent
+    if not _real_dir_chain(parent, vault) and (
+        parent.exists() or parent.is_symlink()
+    ):
+        return (str(parent.relative_to(vault)),)
+    return ()
+
+
 def _remove_staging(op: fsops.StagedOperation) -> None:
     """Finalize the staging directory only when it is a real directory
     inside the vault (lstat boundary re-check, never through a
     symlink): a symlink planted at the staging path can neither make
     the finalize delete anything outside the vault nor make us write
-    outside it. A compromised staging path is simply left untouched."""
-    if _real_dir_chain(op.directory, op.vault_root):
-        shutil.rmtree(op.directory, ignore_errors=True)
+    outside it. A compromised staging path is simply left untouched
+    and is reported as residue by the check that follows."""
+    _remove_staging_dir(op.directory, op.vault_root)
+
+
+def retry_cleanup(vault_root: str | Path, *, operation_id: str) -> CleanupOutcome:
+    """Idempotent, vault-bound, symlink-safe cleanup retry for a
+    deletion reported as ``deleted_with_cleanup_required``.
+
+    Removes the leftover staging directory
+    ``.paper-notes/.staging/<operation_id>`` only when every path
+    component from the vault root down is a real directory (lstat,
+    never through a symlink, never outside the vault): a symlink or
+    non-directory planted at the staging path or its ``.staging``
+    parent is left untouched and reported as residue — nothing
+    external is ever written, deleted or overwritten. Re-running is a
+    safe no-op when nothing remains (the same ``cleaned`` outcome).
+    The already-effective deletion and the published indexes are never
+    rolled back or rewritten by this function.
+
+    ``operation_id`` must be a validated safe path component
+    (``[a-z0-9][a-z0-9_.-]{0,31}``, no ``..``); anything else raises
+    :class:`ValueError` before any filesystem access. The real CLI
+    command wiring for this seam is deferred to a later explicit task.
+    """
+    root = Path(vault_root)
+    validate_operation_id(operation_id)
+    directory = fsops.staging_directory(root, operation_id)
+    try:
+        _remove_staging_dir(directory, root)
+    except Exception:
+        pass  # best-effort: residue is reported, never raised
+    residue = _staging_residue(directory, root)
+    return CleanupOutcome(
+        operation_id=operation_id, residue=residue, cleaned=not residue
+    )
 
 
 def _preserve_racers(
@@ -920,12 +1057,17 @@ class IndexParticipant:
     transition: after the clean final authority the legacy rebuild
     hook runs exactly once INSIDE the transaction, a second full
     authority detects any edit/chmod/type swap the hook performed on a
-    transaction target, and only then is the staging directory removed
-    and the operation finished. A racer or hook divergence at any
-    point rolls the item AND both index files back to their exact
-    bytes+mode with the hook zero times (a hook-time divergence fires
-    it exactly once — the deletion itself is never reported
-    'deleted'). The real ``library.json`` / ``citation-aliases.json``
+    transaction target, and only then is the operation finished — the
+    deletion's linearization point, after which nothing can roll the
+    effective deletion back. Staging cleanup after that point is
+    best-effort: a failure or residue is returned (and surfaced by
+    :func:`confirm_delete` as ``deleted_with_cleanup_required``), never
+    a rollback of the effective deletion. A racer or hook divergence at
+    any pre-linearization point rolls the item AND both index files
+    back to their exact bytes+mode with the hook zero times (a
+    hook-time divergence fires it exactly once — the deletion itself is
+    never reported 'deleted'). The real ``library.json`` /
+    ``citation-aliases.json``
     writer (Task 15) plugs in behind this seam.
     """
 
@@ -976,7 +1118,7 @@ class IndexParticipant:
         fsops.write_target(self._op, self._lib, self._lib_new)
         fsops.write_target(self._op, self._aliases, self._aliases_new)
 
-    def finalize(self, hook: Callable[[], None]) -> None:
+    def finalize(self, hook: Callable[[], None]) -> tuple[str, ...]:
         """Merged final authority, legacy hook and success transition.
 
         Runs after the item deletion, both index publications and the
@@ -1002,11 +1144,18 @@ class IndexParticipant:
            structured conflict that rolls the item AND both index
            files back with the racer preserved at a named recovery
            location;
-        4. success transition — only when both authorities are clean
-           the staging directory is removed (boundary re-checked,
-           never through a symlink) and the operation finished. This
-           is the deletion's linearization point: after the last
-           expected-state authority no writable callback runs.
+        4. success transition — the deletion's linearization point:
+           the operation is finished (only fail-free bookkeeping
+           remains) and the staging directory is removed best-effort
+           (boundary re-checked, never through a symlink). After the
+           last expected-state authority no writable callback runs and
+           nothing here can roll the effective deletion back.
+
+        Returns the vault-relative, desensitized residue paths still
+        present after the cleanup attempt (``()`` when the staging
+        area is fully cleaned); :func:`confirm_delete` surfaces any
+        residue as the structured ``deleted_with_cleanup_required``
+        status instead of a silent ``deleted``.
         """
         op = self._op
         if op is None:
@@ -1016,8 +1165,17 @@ class IndexParticipant:
         self._final_authority(op, item_dir, work_dir)
         hook()
         self._final_authority(op, item_dir, work_dir)
-        _remove_staging(op)
+        # linearization point: the item deletion and both index
+        # publications are formally effective. Only fail-free
+        # bookkeeping and best-effort cleanup remain — a cleanup
+        # failure or residue must never roll the effective transaction
+        # back; it is reported as deleted_with_cleanup_required.
         op._finished = True
+        try:
+            _remove_staging(op)
+        except Exception:
+            pass  # cleanup must never fail the effective deletion
+        return _staging_residue(op.directory, op.vault_root)
 
     def _final_authority(
         self, op: fsops.StagedOperation, item_dir: Path, work_dir: Path
@@ -1080,7 +1238,18 @@ class IndexParticipant:
                 shutil.copy2(staged.backup, path)
 
 
-def _execute(root: Path, plan: DeletePlan, hook: Callable[[], None]) -> None:
+def _execute(
+    root: Path, plan: DeletePlan, hook: Callable[[], None]
+) -> tuple[str, tuple[str, ...]]:
+    """Execute the token-authorized deletion transaction.
+
+    Returns ``(operation_id, residue)``: the generated operation id
+    (the recovery handle) and the vault-relative, desensitized residue
+    paths left by the best-effort post-linearization cleanup (``()``
+    when the staging area is fully cleaned). The caller surfaces any
+    residue as ``deleted_with_cleanup_required`` instead of a silent
+    ``deleted``; the effective deletion is never rolled back.
+    """
     item_dir = paper_directory(root, plan.key)
     work_dir = _work_directory(item_dir)
     op: fsops.StagedOperation | None = None
@@ -1188,23 +1357,37 @@ def _execute(root: Path, plan: DeletePlan, hook: Callable[[], None]) -> None:
         #     never an arbitrary writable callback after the final
         #     check, so a hook-time edit/chmod/type swap of an index
         #     file is detected and rolled back with the item. After
-        #     this returns the deletion is committed: the staging
-        #     directory is gone, the operation is finished and only
-        #     fail-free bookkeeping remains (the linearization point).
-        participant.finalize(hook)
+        #     the second authority the deletion is formally effective
+        #     (the linearization point): only fail-free bookkeeping and
+        #     best-effort staging cleanup remain, and any residue is
+        #     returned for the caller to surface as
+        #     deleted_with_cleanup_required (never a silent 'deleted',
+        #     never a rollback of the effective deletion).
+        residue = participant.finalize(hook)
         committed = True
+        return op.operation_id, residue
     except fsops.OperationConflict:
+        if op is not None and op._finished:
+            committed = True  # already effective: never roll it back
         _abort(op, committed, phase, plan, item_dir, work_dir, participant)
         raise ItemConflict("concurrent change detected while deleting item") from None
     except ItemError:
+        if op is not None and op._finished:
+            committed = True
         _abort(op, committed, phase, plan, item_dir, work_dir, participant)
         raise
     except ItemConflict:
+        if op is not None and op._finished:
+            committed = True
         _abort(op, committed, phase, plan, item_dir, work_dir, participant)
         raise
     except Exception:
+        if op is not None and op._finished:
+            committed = True
         _abort(op, committed, phase, plan, item_dir, work_dir, participant)
         raise ItemError("item deletion failed") from None
     except BaseException:
+        if op is not None and op._finished:
+            committed = True
         _abort(op, committed, phase, plan, item_dir, work_dir, participant)
         raise
