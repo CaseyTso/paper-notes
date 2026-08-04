@@ -14,7 +14,7 @@ import traceback
 from pathlib import Path
 from typing import Any, NoReturn
 
-from . import __version__, attachments, citations, deletion, items
+from . import __version__, attachments, citations, csl, deletion, items
 from .identifiers import extract_identifiers, parse_arxiv, parse_doi, parse_pmcid, parse_pmid
 from .protocol import (
     EXIT_CONFLICT,
@@ -190,6 +190,33 @@ def build_parser(json_mode: bool) -> _JsonAwareArgumentParser:
         help="confirmation token from a previous item delete dry-run",
     )
     delete_parser.set_defaults(func=_cmd_item_delete)
+
+    index_parser = subparsers.add_parser(
+        "index",
+        help="rebuild citation indexes or validate a manuscript",
+        json_mode=json_mode,
+    )
+    index_parser.set_defaults(func=_cmd_index_root)
+    index_subparsers = index_parser.add_subparsers(dest="index_command")
+
+    rebuild_parser = index_subparsers.add_parser(
+        "rebuild",
+        help="deterministically rebuild library.json and citation-aliases.json",
+        json_mode=json_mode,
+    )
+    rebuild_parser.add_argument("--vault", required=True, help="vault root directory")
+    rebuild_parser.set_defaults(func=_cmd_index_rebuild)
+
+    validate_parser = index_subparsers.add_parser(
+        "validate-manuscript",
+        help="validate manuscript citations through the Pandoc AST",
+        json_mode=json_mode,
+    )
+    validate_parser.add_argument("--vault", required=True, help="vault root directory")
+    validate_parser.add_argument(
+        "--input", required=True, help="manuscript Markdown file"
+    )
+    validate_parser.set_defaults(func=_cmd_index_validate)
     return parser
 
 
@@ -201,6 +228,57 @@ def _cmd_item_root(args: argparse.Namespace) -> Envelope:
     raise UserError(
         "missing item subcommand: use create, show, update, attach-pdf, "
         "reconcile, rename-key, or delete"
+    )
+
+
+def _cmd_index_root(args: argparse.Namespace) -> Envelope:
+    raise UserError(
+        "missing index subcommand: use rebuild or validate-manuscript"
+    )
+
+
+def _cmd_index_rebuild(args: argparse.Namespace) -> Envelope:
+    result = csl.rebuild_indexes(Path(args.vault))
+    warnings = [
+        Issue(code=record.code, message=record.message, path=str(record.path))
+        for record in result.invalid
+    ]
+    return success(
+        {
+            "library": str(result.library_path),
+            "aliases": str(result.aliases_path),
+            "papers": result.papers,
+            "aliases_count": result.aliases,
+            "invalid_count": len(result.invalid),
+        },
+        warnings=warnings,
+    )
+
+
+def _cmd_index_validate(args: argparse.Namespace) -> Envelope:
+    try:
+        report = csl.validate_manuscript(Path(args.vault), Path(args.input))
+    except (csl.PandocMissingError, csl.ManuscriptError) as exc:
+        raise UserError(str(exc)) from exc
+    if report.unknown:
+        issues = [
+            Issue(
+                code="unknown_citation_key",
+                message=(
+                    f"{args.input}:{entry.line}:{entry.column}: "
+                    f"unknown citation key {entry.key!r}"
+                ),
+                path=str(Path(args.input)),
+            )
+            for entry in report.unknown
+        ]
+        return error(issues)
+    return success(
+        {
+            "input": str(Path(args.input)),
+            "citations": report.citations,
+            "unknown": [],
+        }
     )
 
 
