@@ -6,22 +6,37 @@
 - :func:`staging` is a context manager that creates
   ``<vault>/.paper-notes/.staging/<operation-id>/`` and removes it on
   success and on exception.
+- :func:`no_replace_move` moves a file or directory with the dirfd
+  anchored no-replace primitive (macOS ``renameatx_np RENAME_EXCL``):
+  both parents are anchored as directory file descriptors opened step
+  by step from the vault root with ``O_NOFOLLOW``, so a parent path
+  swapped for an outside symlink after the last path check can never
+  redirect the rename outside the vault; an existing destination is
+  never replaced (the late racer stays byte-for-byte);
+  :class:`MoveTargetExists` and :class:`NoReplaceMoveError` are the
+  structured outcomes.
 - :class:`StagedOperation` snapshots every target an operation may
   modify (:func:`stage_target`), records every **managed** write
   (:func:`write_target` / :func:`delete_target`) with its content hash,
   then either :func:`commit` (keep the new state) or :func:`rollback`
   (restore every snapshot that is still exactly the managed write).
-  Targets whose content changed outside the managed helpers are never
-  touched; they are preserved and reported as conflicts.
+  :func:`commit_detect` runs the commit conflict verdict without
+  destroying the staging directory, so a conflicted transaction can
+  still be rolled back completely. Targets whose content changed
+  outside the managed helpers are never touched; they are preserved
+  and reported as conflicts.
 
 All targets and the staging area are confined to the vault; operation
 ids are validated safe single path components.
 """
 
+import ctypes
+import errno
 import hashlib
 import os
 import shutil
 import stat
+import sys
 import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -34,9 +49,32 @@ STAGING_DIR = ".staging"
 
 _DEFAULT_MODE = 0o644
 
+# macOS <stdio.h>: fail when the target exists (works for files, empty
+# directories and symlinks alike).
+_RENAME_EXCL = 0x00000004
+# macOS <fcntl.h>: fstatat must not follow the final symlink.
+_AT_SYMLINK_NOFOLLOW = 0x0020
+
 
 class OperationConflict(Exception):
     """A staging directory for this operation already exists."""
+
+
+class MoveTargetExists(Exception):
+    """The no-replace move destination appeared before the rename.
+
+    Both the source and the late destination racer are preserved
+    byte-for-byte at their exact paths.
+    """
+
+
+class NoReplaceMoveError(Exception):
+    """The no-replace move failed closed without any write.
+
+    Missing or wrong-type sources, symlinks / non-directories anywhere
+    in a parent chain, outside-vault parents and unsupported platforms
+    all fail closed; the external state is preserved untouched.
+    """
 
 
 def atomic_replace(target: Path, content: str | bytes, mode: int | None = None) -> None:
@@ -65,6 +103,204 @@ def atomic_replace(target: Path, content: str | bytes, mode: int | None = None) 
         except OSError:
             pass
         raise
+
+
+# ---------------------------------------------------------------------------
+# dirfd-anchored atomic no-replace move
+# ---------------------------------------------------------------------------
+#
+# The security boundary is the anchored directory file descriptor, not a
+# path pre-check: both parents are opened as O_NOFOLLOW directory fds
+# component by component from the vault root (openat), so a parent path
+# swapped for a symlink after the last path check can never redirect
+# the rename outside the vault. The rename itself is renameatx_np(...
+# RENAME_EXCL): an existing destination — file, directory or symlink —
+# is never replaced. The source type is re-verified by fstatat (no
+# follow) immediately before the rename.
+
+
+def _openat(dirfd: int, name: str, flags: int) -> int:
+    """ctypes ``openat``; raises OSError(errno) on failure."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    openat = libc.openat
+    openat.restype = ctypes.c_int
+    openat.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int)
+    fd = openat(dirfd, os.fsencode(name), flags)
+    if fd < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err), name)
+    return fd
+
+
+def _open_chain(vault_root: Path, parent: Path) -> int:
+    """Open ``parent`` as an O_NOFOLLOW directory fd anchored at the
+    vault root, one component at a time.
+
+    The anchor fd is opened on the resolved vault directory (a vault
+    path spelled through a symlink such as macOS ``/var`` ->
+    ``/private/var`` still anchors on the real directory), while the
+    relative component sequence is taken from the lexical absolute
+    paths, so an in-vault parent chain is walked component by
+    component. Any symlink or non-directory anywhere in the chain
+    fails closed with OSError (never followed, never resolved
+    through)."""
+    fd = os.open(vault_root.resolve(), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        rel_base = vault_root.absolute()
+        for comp in parent.relative_to(rel_base).parts:
+            fd = _openat(fd, comp, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        return fd
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+
+class _MacStat(ctypes.Structure):
+    """macOS ``struct stat`` (LP64 layout, arm64 and x86_64)."""
+
+    _fields_ = [
+        ("st_dev", ctypes.c_int32),
+        ("st_mode", ctypes.c_uint16),
+        ("st_nlink", ctypes.c_uint16),
+        ("st_ino", ctypes.c_uint64),
+        ("st_uid", ctypes.c_uint32),
+        ("st_gid", ctypes.c_uint32),
+        ("st_rdev", ctypes.c_int32),
+        ("st_atimespec", ctypes.c_int64 * 2),
+        ("st_mtimespec", ctypes.c_int64 * 2),
+        ("st_ctimespec", ctypes.c_int64 * 2),
+        ("st_birthtimespec", ctypes.c_int64 * 2),
+        ("st_size", ctypes.c_int64),
+        ("st_blocks", ctypes.c_int64),
+        ("st_blksize", ctypes.c_int32),
+        ("st_flags", ctypes.c_uint32),
+        ("st_gen", ctypes.c_uint32),
+        ("st_lspare", ctypes.c_int32),
+        ("st_qspare", ctypes.c_int64 * 2),
+    ]
+
+
+def _fstatat_mode(fd: int, name: str) -> int | None:
+    """``fstatat(fd, name, AT_SYMLINK_NOFOLLOW)`` raw st_mode, or None
+    when ``name`` is missing (ENOENT)."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    fstatat = libc.fstatat
+    fstatat.restype = ctypes.c_int
+    fstatat.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.POINTER(_MacStat),
+        ctypes.c_int,
+    )
+    buf = _MacStat()
+    rc = fstatat(fd, os.fsencode(name), ctypes.byref(buf), _AT_SYMLINK_NOFOLLOW)
+    if rc != 0:
+        err = ctypes.get_errno()
+        if err == errno.ENOENT:
+            return None
+        raise OSError(err, os.strerror(err), name)
+    return buf.st_mode
+
+
+def _renameatx_np(fromfd: int, fromname: str, tofd: int, toname: str, flags: int) -> None:
+    """ctypes ``renameatx_np``; raises OSError(errno) on failure."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameatx_np = libc.renameatx_np
+    renameatx_np.restype = ctypes.c_int
+    renameatx_np.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    rc = renameatx_np(
+        fromfd, os.fsencode(fromname), tofd, os.fsencode(toname), flags
+    )
+    if rc != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err), toname)
+
+
+def no_replace_move(
+    source: Path,
+    target: Path,
+    *,
+    vault_root: Path,
+    source_kind: str = "any",
+) -> None:
+    """dirfd-anchored atomic no-replace move of ``source`` onto ``target``.
+
+    Both parents are anchored as O_NOFOLLOW directory fds opened step
+    by step from the vault root, so a parent path swapped for a symlink
+    after the last path check can never redirect the rename outside the
+    vault (zero outside writes; the planted symlink untouched). The
+    rename itself is ``renameatx_np(..., RENAME_EXCL)``: an existing
+    destination — file, empty or non-empty directory, or symlink — is
+    never replaced; the late racer stays at its exact path with its
+    exact bytes and :class:`MoveTargetExists` is raised with the source
+    preserved. ``source_kind`` (``"file"`` | ``"dir"`` | ``"any"``)
+    re-verifies the source type by no-follow fstatat immediately before
+    the rename: a source swapped to a different type fails closed with
+    :class:`NoReplaceMoveError` and the external state is preserved.
+    Missing sources, symlinks/non-directories anywhere in a parent
+    chain, outside-vault parents and unsupported platforms also fail
+    closed with zero writes.
+    """
+    if sys.platform != "darwin":
+        raise NoReplaceMoveError(
+            "atomic no-replace move is unsupported on this platform"
+        )
+    vault = vault_root.resolve()
+    for label, path in (("source", source), ("target", target)):
+        resolved = path.resolve()
+        if resolved == vault or not resolved.is_relative_to(vault):
+            raise NoReplaceMoveError(f"{label} {path} is outside the vault")
+    src_fd: int | None = None
+    dst_fd: int | None = None
+    try:
+        try:
+            src_fd = _open_chain(vault_root, source.parent)
+            dst_fd = _open_chain(vault_root, target.parent)
+        except OSError:
+            raise NoReplaceMoveError(
+                "a parent directory chain is missing, is a symlink, or is "
+                "outside the vault; nothing was moved"
+            ) from None
+        except ValueError:
+            raise NoReplaceMoveError(
+                f"source {source} or target {target} is outside the vault"
+            ) from None
+        mode = _fstatat_mode(src_fd, source.name)
+        if mode is None:
+            raise NoReplaceMoveError(f"source {source} is missing")
+        if source_kind == "file" and not stat.S_ISREG(mode):
+            raise NoReplaceMoveError(f"source {source} is not a regular file")
+        if source_kind == "dir" and not stat.S_ISDIR(mode):
+            raise NoReplaceMoveError(f"source {source} is not a directory")
+        if source_kind == "any" and not (
+            stat.S_ISREG(mode) or stat.S_ISDIR(mode) or stat.S_ISLNK(mode)
+        ):
+            raise NoReplaceMoveError(f"source {source} is not a moveable path")
+        try:
+            _renameatx_np(src_fd, source.name, dst_fd, target.name, _RENAME_EXCL)
+        except OSError as exc:
+            if exc.errno == errno.EEXIST:
+                raise MoveTargetExists(
+                    f"destination {target} appeared before the rename; "
+                    "it was preserved and the source was left in place"
+                ) from None
+            raise NoReplaceMoveError(f"rename failed: {exc}") from None
+    finally:
+        for fd in (src_fd, dst_fd):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
 
 def staging_directory(vault_root: Path, operation_id: str) -> Path:
@@ -366,6 +602,22 @@ def _rollback_target(op: StagedOperation, target: Path, staged: StagedTarget, co
             conflicts.append(target)  # modified/replaced externally
     elif fingerprint != _FP_ABSENT_TUPLE:
         conflicts.append(target)  # created/replaced externally
+
+
+def commit_detect(op: StagedOperation) -> list[Path]:
+    """Non-destructive commit verdict: conflict detection identical to
+    :func:`commit` (every target compared against its expected
+    fingerprint, vault escapes included) without removing the staging
+    directory or finishing the operation — a conflicted transaction can
+    still be rolled back completely."""
+    op._ensure_open()
+    conflicts: list[Path] = []
+    for target, staged in op.targets.items():
+        if not _target_within_vault(op, target):
+            conflicts.append(target)
+        elif _file_fingerprint(target) != _expected_fingerprint(staged):
+            conflicts.append(target)
+    return conflicts
 
 
 def commit(op: StagedOperation) -> list[Path]:

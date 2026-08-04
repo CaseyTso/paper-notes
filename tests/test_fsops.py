@@ -7,6 +7,7 @@ import os
 import stat
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 
 from paper_notes import fsops
@@ -541,6 +542,209 @@ class StagedOperationTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 fsops.write_target(op, a, "x")
             fsops.commit(op)
+
+
+class NoReplaceMoveTest(unittest.TestCase):
+    """Frozen repair-R3 regressions: the dirfd-anchored atomic no-replace
+    move primitive (paper_notes.fsops.no_replace_move).
+
+    Contract:
+    - Both parents are opened as directory fds (O_NOFOLLOW) and
+      re-verified inside the vault immediately before the rename, so a
+      parent path swapped for an outside symlink after the last path
+      check can never redirect the write outside the vault (zero outside
+      writes, the planted symlink untouched).
+    - The rename runs renameatx_np(..., RENAME_EXCL): an existing
+      destination (file, empty or non-empty directory, symlink) is never
+      replaced — the late racer stays at its exact path with its exact
+      bytes and MoveTargetExists is raised with the source preserved.
+    - source_kind ("file"|"dir") re-verifies the source type by fstatat
+      (no-follow) immediately before the rename: a source swapped to a
+      different type (file->dir, file->symlink, dir->file) is a
+      structured NoReplaceMoveError with the external state preserved.
+    - Missing sources and unsupported platforms fail closed.
+    """
+
+    @contextmanager
+    def _layout(self):
+        td = tempfile.TemporaryDirectory()
+        try:
+            vault = Path(td.name) / "vault"
+            vault.mkdir()
+            (vault / "a").mkdir()
+            (vault / "b").mkdir()
+            yield td, vault, vault / "a", vault / "b"
+        finally:
+            td.cleanup()
+
+    def test_file_move_success(self):
+        with tempfile.TemporaryDirectory() as td:
+            vault = Path(td) / "vault"
+            vault.mkdir()
+            (vault / "a").mkdir()
+            (vault / "b").mkdir()
+            src = vault / "a" / "f.txt"
+            src.write_text("payload")
+            fsops.no_replace_move(src, vault / "b" / "f.txt", vault_root=vault)
+            self.assertFalse(src.exists())
+            self.assertEqual((vault / "b" / "f.txt").read_text(), "payload")
+
+    def test_directory_move_success(self):
+        with tempfile.TemporaryDirectory() as td:
+            vault = Path(td) / "vault"
+            vault.mkdir()
+            (vault / "a").mkdir()
+            (vault / "b").mkdir()
+            src = vault / "a" / "sub"
+            src.mkdir()
+            (src / "inner.txt").write_text("x")
+            fsops.no_replace_move(src, vault / "b" / "sub", vault_root=vault)
+            self.assertFalse(src.exists())
+            self.assertEqual((vault / "b" / "sub" / "inner.txt").read_text(), "x")
+
+    def test_late_destination_file_racer_preserved(self):
+        import unittest.mock as mock
+
+        with self._layout() as (td, vault, a, b):
+            src = a / "f.txt"
+            src.write_text("source")
+            real = fsops._renameatx_np
+
+            def racer(fromfd, fromname, tofd, toname, flags):
+                (b / "f.txt").write_text("racer")  # appears after the last check
+                return real(fromfd, fromname, tofd, toname, flags)
+
+            with mock.patch("paper_notes.fsops._renameatx_np", side_effect=racer):
+                with self.assertRaises(fsops.MoveTargetExists):
+                    fsops.no_replace_move(src, b / "f.txt", vault_root=vault)
+            # source preserved, racer preserved byte-for-byte
+            self.assertEqual(src.read_text(), "source")
+            self.assertEqual((b / "f.txt").read_text(), "racer")
+
+    def test_late_empty_directory_racer_preserved(self):
+        import unittest.mock as mock
+
+        with self._layout() as (td, vault, a, b):
+            src = a / "d"
+            src.mkdir()
+            (src / "x.txt").write_text("x")
+            real = fsops._renameatx_np
+
+            def racer(fromfd, fromname, tofd, toname, flags):
+                (b / "d").mkdir()  # empty-directory racer at the destination
+                return real(fromfd, fromname, tofd, toname, flags)
+
+            with mock.patch("paper_notes.fsops._renameatx_np", side_effect=racer):
+                with self.assertRaises(fsops.MoveTargetExists):
+                    fsops.no_replace_move(src, b / "d", vault_root=vault)
+            self.assertTrue((a / "d" / "x.txt").is_file())  # source intact
+            self.assertTrue((b / "d").is_dir())  # racer directory preserved
+
+    def test_parent_symlink_swap_never_writes_outside(self):
+        import unittest.mock as mock
+
+        with self._layout() as (td, vault, a, b), tempfile.TemporaryDirectory() as otd:
+            outside = Path(otd)
+            src = a / "f.txt"
+            src.write_text("source")
+            real = fsops._renameatx_np
+
+            def swap(fromfd, fromname, tofd, toname, flags):
+                # parent swapped to an outside symlink after the last check
+                os.replace(b, vault / "b.real")
+                b.symlink_to(outside, target_is_directory=True)
+                return real(fromfd, fromname, tofd, toname, flags)
+
+            with mock.patch("paper_notes.fsops._renameatx_np", side_effect=swap):
+                fsops.no_replace_move(src, b / "f.txt", vault_root=vault)
+            # the rename landed in the anchored (now renamed-aside) real
+            # directory, never through the symlink
+            self.assertEqual((vault / "b.real" / "f.txt").read_text(), "source")
+            # zero outside writes; planted symlink untouched
+            self.assertEqual(sorted(os.listdir(outside)), [])
+            self.assertTrue(b.is_symlink())
+            self.assertEqual(os.readlink(b), str(outside))
+
+    def test_source_swapped_to_directory_conflicts(self):
+        import unittest.mock as mock
+
+        with self._layout() as (td, vault, a, b):
+            src = a / "f.txt"
+            src.write_text("source")
+            real_stat = fsops._fstatat_mode
+
+            def swap(fd, name, **kw):
+                # source swapped to a directory between the plan and the rename
+                os.unlink(src)
+                src.mkdir()
+                return real_stat(fd, name, **kw)
+
+            with mock.patch("paper_notes.fsops._fstatat_mode", side_effect=swap):
+                with self.assertRaises(fsops.NoReplaceMoveError):
+                    fsops.no_replace_move(
+                        src, b / "f.txt", vault_root=vault, source_kind="file"
+                    )
+            self.assertTrue(src.is_dir())  # external swap preserved
+            self.assertFalse((b / "f.txt").exists())  # nothing moved
+
+    def test_source_swapped_to_symlink_conflicts(self):
+        import unittest.mock as mock
+
+        with self._layout() as (td, vault, a, b), tempfile.TemporaryDirectory() as otd:
+            src = a / "f.txt"
+            src.write_text("source")
+            real_stat = fsops._fstatat_mode
+
+            def swap(fd, name, **kw):
+                os.unlink(src)
+                src.symlink_to(Path(otd) / "target")
+                return real_stat(fd, name, **kw)
+
+            with mock.patch("paper_notes.fsops._fstatat_mode", side_effect=swap):
+                with self.assertRaises(fsops.NoReplaceMoveError):
+                    fsops.no_replace_move(
+                        src, b / "f.txt", vault_root=vault, source_kind="file"
+                    )
+            self.assertTrue(src.is_symlink())  # external swap preserved
+            self.assertEqual(os.readlink(src), str(Path(otd) / "target"))
+            self.assertFalse((b / "f.txt").exists())
+
+    def test_destination_swapped_to_directory_conflicts(self):
+        import unittest.mock as mock
+
+        with self._layout() as (td, vault, a, b):
+            src = a / "f.txt"
+            src.write_text("source")
+            real = fsops._renameatx_np
+
+            def racer(fromfd, fromname, tofd, toname, flags):
+                (b / "f.txt").mkdir()  # destination type change: file -> dir
+                return real(fromfd, fromname, tofd, toname, flags)
+
+            with mock.patch("paper_notes.fsops._renameatx_np", side_effect=racer):
+                with self.assertRaises(fsops.MoveTargetExists):
+                    fsops.no_replace_move(src, b / "f.txt", vault_root=vault)
+            self.assertEqual(src.read_text(), "source")  # source preserved
+            self.assertTrue((b / "f.txt").is_dir())  # racer directory preserved
+
+    def test_missing_source_fails_closed(self):
+        with self._layout() as (td, vault, a, b):
+            with self.assertRaises(fsops.NoReplaceMoveError):
+                fsops.no_replace_move(
+                    a / "missing.txt", b / "x.txt", vault_root=vault, source_kind="file"
+                )
+
+    def test_outside_vault_parent_fails_closed(self):
+        with self._layout() as (td, vault, a, b), tempfile.TemporaryDirectory() as otd:
+            src = a / "f.txt"
+            src.write_text("source")
+            # target parent is a symlink pointing outside the vault
+            os.replace(b, vault / "b.real")
+            b.symlink_to(Path(otd), target_is_directory=True)
+            with self.assertRaises(fsops.NoReplaceMoveError):
+                fsops.no_replace_move(src, b / "f.txt", vault_root=vault)
+            self.assertEqual(sorted(os.listdir(Path(otd))), [])  # zero outside writes
+            self.assertEqual(src.read_text(), "source")
 
 
 if __name__ == "__main__":

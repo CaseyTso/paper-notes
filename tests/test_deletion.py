@@ -48,6 +48,30 @@ Contract (spec §8.3 + plan Task 14 + manager approval):
   the planted symlink is left untouched.
 - Error messages and CLI JSON never leak the confirmation original
   text or underlying exceptions.
+- Repair-R3 frozen regressions (Decision A, each verified red before
+  the fix): the deletion and the citation-index publication are ONE
+  transaction seam driven by a minimal transactional participant
+  (paper_notes.deletion.IndexParticipant, the Task 15 real-writer
+  seam) writing .paper-notes/library.json and
+  .paper-notes/citation-aliases.json as staged managed writes:
+  (a) every move (item canonical -> hidden work, racer -> recovery,
+  rollback restore) uses the dirfd-anchored atomic no-replace
+  primitive paper_notes.fsops.no_replace_move — a late destination
+  racer is preserved byte-for-byte, a recovery parent swapped to an
+  outside symlink after the last check receives zero outside writes,
+  and a file appearing at the recovery destination after its last
+  check leaves the pre-seeded bytes untouched while the racer lands at
+  a fresh in-vault path; (b) a racer reappearing at a hidden work
+  target after the clean verdict but before the hook, and an external
+  edit/chmod/type swap between the two index outputs, and a
+  prepare/write/commit/finalize failure all roll the item AND both
+  index files back to their exact bytes+mode with the racer preserved
+  (at a named recovery location) and the hook zero times; (c) success
+  makes the item deletion and both index files' new state visible
+  together with the participant running exactly once; the R2
+  _reappeared_targets clean check is gone — the final authority (a
+  full expected-state detection) is the plain rebuild_hook success
+  window.
 """
 
 import contextlib
@@ -201,6 +225,46 @@ def assert_zero_side_effects(testcase, root, hook=None):
     testcase.assertEqual(staging_residue(root), [])
     if hook is not None:
         hook.assert_not_called()
+
+
+def index_paths(root):
+    pn = Path(root) / ".paper-notes"
+    return pn / "library.json", pn / "citation-aliases.json"
+
+
+def seed_index(root, library=None, aliases=None):
+    """Seed the two mock citation-index files (the R3 transactional
+    participant's outputs) and return (lib, aliases, before_bytes,
+    before_modes)."""
+    lib, al = index_paths(root)
+    lib.parent.mkdir(parents=True, exist_ok=True)
+    lib.write_text(
+        json.dumps(
+            library if library is not None else {"papers": {OTHER: "other-uuid"}},
+            sort_keys=True,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    al.write_text(
+        json.dumps(
+            aliases if aliases is not None else {"aliases": {}},
+            sort_keys=True,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return lib, al, lib.read_bytes(), al.read_bytes(), lib.lstat().st_mode, al.lstat().st_mode
+
+
+def assert_index_restored(testcase, root, before):
+    lib, al = index_paths(root)
+    testcase.assertEqual(lib.read_bytes(), before[2])
+    testcase.assertEqual(al.read_bytes(), before[3])
+    testcase.assertEqual(stat.S_IMODE(lib.lstat().st_mode), stat.S_IMODE(before[4]))
+    testcase.assertEqual(stat.S_IMODE(al.lstat().st_mode), stat.S_IMODE(before[5]))
 
 
 # ---------------------------------------------------------------------------
@@ -1009,6 +1073,492 @@ class RecoveryEscapeTest(unittest.TestCase):
                     p = Path(dirpath) / f
                     if p.is_file() and p.read_bytes() == racer_content:
                         racer_paths.append(p)
+            self.assertEqual(len(racer_paths), 1)
+            self.assertTrue(racer_paths[0].resolve().is_relative_to(root.resolve()))
+
+
+# ---------------------------------------------------------------------------
+# Repair-R3 frozen regressions: deletion + citation-index publication as
+# one transaction seam (dirfd no-replace primitive, transactional
+# participant, final-authority success window)
+# ---------------------------------------------------------------------------
+
+
+class TransactionSeamTest(unittest.TestCase):
+    """Frozen repair-R3 regressions: the deletion and the citation-index
+    publication are ONE transaction. The fake index writer
+    (deletion.IndexParticipant) writes both mock index files as staged
+    managed writes, so a failure in prepare/write/commit/finalize or an
+    external racer rolls the item AND both index files back to their
+    exact bytes+mode; on success the item deletion and both index
+    files' new state are visible together and the participant runs
+    exactly once."""
+
+    def test_success_updates_both_indexes_and_runs_participant_once(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            make_vault(root)
+            before = vault_manifest(root)
+            removed_rel = sorted(
+                [str(p.relative_to(root)) for p in item(root, OLD).rglob("*")]
+                + [str(item(root, OLD).relative_to(root))]
+            )
+            lib, al, lib_b, al_b, lib_m, al_m = seed_index(
+                root,
+                library={"papers": {OLD: PAPER_ID, OTHER: "other-uuid"}},
+                aliases={"aliases": {ALIAS: OLD, "smithAlias": "smithExample2026"}},
+            )
+            hook = mock.Mock()
+            real_commit = deletion.IndexParticipant.commit
+            real_finalize = deletion.IndexParticipant.finalize
+            commits, finalizes = [], []
+
+            def counting_commit(self):
+                commits.append(1)
+                return real_commit(self)
+
+            def counting_finalize(self):
+                finalizes.append(1)
+                return real_finalize(self)
+
+            with mock.patch.object(
+                deletion.IndexParticipant, "commit", counting_commit
+            ), mock.patch.object(
+                deletion.IndexParticipant, "finalize", counting_finalize
+            ):
+                result = confirm(root, get_token(root), hook=hook)
+
+            self.assertEqual(result.status, "deleted")
+            hook.assert_called_once_with()
+            # the item deletion and both index files' new state are
+            # visible together; the deleted key is gone from both files
+            self.assertFalse(item(root, OLD).exists())
+            self.assertFalse(item(root, OLD).is_symlink())
+            self.assertEqual(
+                json.loads(lib.read_text()), {"papers": {OTHER: "other-uuid"}}
+            )
+            self.assertEqual(
+                json.loads(al.read_text()), {"aliases": {"smithAlias": "smithExample2026"}}
+            )
+            # participant ran exactly once
+            self.assertEqual(commits, [1])
+            self.assertEqual(finalizes, [1])
+            # every other vault byte/mode unchanged, no residue
+            after = vault_manifest(root)
+            added, removed, changed = manifest_diff(before, after)
+            self.assertEqual(added, [])
+            self.assertEqual(changed, [])
+            self.assertEqual(removed, removed_rel)
+            self.assertFalse((root / ".paper-notes" / "write.lock").exists())
+            self.assertEqual(staging_residue(root), [])
+            self.assertFalse(workdir(root).exists())
+
+    def test_racer_after_clean_verdict_conflicts_restores_item_and_indexes(self):
+        """Clean verdict 后、旧 hook 前注入 hidden work-target racer:
+        no success / no hook publication; item fully restored; racer
+        preserved at a named recovery location; both index files rolled
+        back to their exact pre-transaction bytes+mode (the R2
+        _reappeared_targets clean check is replaced by the final
+        authority, the plain rebuild_hook success window)."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            make_vault(root)
+            before = vault_manifest(root)
+            index_before = seed_index(root)
+            original_note = note(root, OLD).read_bytes()
+            hook = mock.Mock()
+            work = workdir(root)
+            racer_content = b"post-verdict racer at a staged hidden work target"
+            real_verdict = deletion._commit_verdict
+
+            def post_verdict_racer(op):
+                verdict = real_verdict(op)  # clean
+                self.assertEqual(verdict, [])
+                target = next(
+                    t
+                    for t in op.targets
+                    if work in t.parents and t.name == f"{OLD}.md"
+                )
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(racer_content)
+                return verdict
+
+            with mock.patch(
+                "paper_notes.deletion._commit_verdict", side_effect=post_verdict_racer
+            ):
+                with self.assertRaises(items.ItemConflict) as ctx:
+                    confirm(root, get_token(root), hook=hook)
+
+            self.assertIn(f"{OLD}.md", str(ctx.exception))
+            hook.assert_not_called()
+            self.assertEqual(vault_manifest(root), before)
+            self.assertEqual(note(root, OLD).read_bytes(), original_note)
+            # both index files rolled back to their exact bytes+mode
+            assert_index_restored(self, root, index_before)
+            self.assertFalse(workdir(root).exists())
+            self.assertFalse((root / ".paper-notes" / "write.lock").exists())
+            self.assertEqual(staging_residue(root), [])
+            # the racer survives untouched at a named recovery location
+            op_dirs = sorted((root / ".paper-notes" / "recovery").glob("*"))
+            self.assertEqual(len(op_dirs), 1)
+            racer_backup = op_dirs[0] / f"{OLD}.md"
+            self.assertEqual(racer_backup.read_bytes(), racer_content)
+            self.assertNotEqual(racer_backup.read_bytes(), original_note)
+
+
+class ParticipantFailureTest(unittest.TestCase):
+    """Frozen repair-R3 regressions: a failure in the fake citation
+    participant's prepare/write/commit/finalize phases or an external
+    edit/chmod/type swap at an index path rolls the item AND both index
+    files back to their exact bytes+mode, the hook fires zero times,
+    and no staging/work residue is left behind."""
+
+    def _scenario(self, seed=True):
+        td = tempfile.TemporaryDirectory()
+        root = Path(td.name)
+        make_vault(root)
+        before = vault_manifest(root)
+        index_before = seed_index(root) if seed else None
+        hook = mock.Mock()
+        return td, root, before, index_before, hook
+
+    def test_mid_write_failure_rolls_back_item_and_indexes(self):
+        """两输出中途失败: the second index write raises — the item and
+        BOTH index files roll back to their exact pre-transaction
+        bytes+mode with no residue."""
+        td, root, before, index_before, hook = self._scenario()
+        with td:
+            real_write = fsops.write_target
+            calls = {"n": 0}
+
+            def failing_second(op, target, content):
+                calls["n"] += 1
+                if calls["n"] == 2:
+                    raise OSError("simulated mid-write failure")
+                return real_write(op, target, content)
+
+            with mock.patch(
+                "paper_notes.deletion.fsops.write_target", side_effect=failing_second
+            ):
+                with self.assertRaises(items.ItemError):
+                    confirm(root, get_token(root), hook=hook)
+            self.assertEqual(vault_manifest(root), before)
+            assert_index_restored(self, root, index_before)
+            hook.assert_not_called()
+            self.assertFalse(workdir(root).exists())
+            self.assertFalse((root / ".paper-notes" / "write.lock").exists())
+            self.assertEqual(staging_residue(root), [])
+
+    def test_external_edit_after_first_output_blocks_second_write(self):
+        """第一输出后 external edit: the external bytes land on the
+        second index file after the first output — the second write's
+        expected-state guard refuses, the first output is rolled back,
+        and the racer bytes are preserved untouched (never adopted)."""
+        td, root, before, index_before, hook = self._scenario()
+        with td:
+            racer_bytes = b"external edit after the first index output"
+            real_write = fsops.write_target
+            calls = {"n": 0}
+
+            def guarded(op, target, content):
+                calls["n"] += 1
+                if calls["n"] == 2:
+                    Path(target).write_bytes(racer_bytes)
+                return real_write(op, target, content)
+
+            with mock.patch(
+                "paper_notes.deletion.fsops.write_target", side_effect=guarded
+            ):
+                with self.assertRaises(items.ItemConflict):
+                    confirm(root, get_token(root), hook=hook)
+            self.assertEqual(vault_manifest(root), before)
+            lib, al = index_paths(root)
+            self.assertEqual(lib.read_bytes(), index_before[2])  # first output undone
+            self.assertEqual(al.read_bytes(), racer_bytes)  # racer preserved
+            hook.assert_not_called()
+            self.assertFalse(workdir(root).exists())
+            self.assertFalse((root / ".paper-notes" / "write.lock").exists())
+            self.assertEqual(staging_residue(root), [])
+
+    def test_external_chmod_after_first_output_blocks_second_write(self):
+        td, root, before, index_before, hook = self._scenario()
+        with td:
+            real_write = fsops.write_target
+            calls = {"n": 0}
+
+            def guarded(op, target, content):
+                calls["n"] += 1
+                if calls["n"] == 2:
+                    os.chmod(Path(target), 0o600)
+                return real_write(op, target, content)
+
+            with mock.patch(
+                "paper_notes.deletion.fsops.write_target", side_effect=guarded
+            ):
+                with self.assertRaises(items.ItemConflict):
+                    confirm(root, get_token(root), hook=hook)
+            self.assertEqual(vault_manifest(root), before)
+            lib, al = index_paths(root)
+            self.assertEqual(lib.read_bytes(), index_before[2])  # first output undone
+            self.assertEqual(
+                stat.S_IMODE(al.lstat().st_mode), 0o600
+            )  # external chmod preserved
+            hook.assert_not_called()
+            self.assertFalse(workdir(root).exists())
+            self.assertFalse((root / ".paper-notes" / "write.lock").exists())
+            self.assertEqual(staging_residue(root), [])
+
+    def test_external_type_swap_after_first_output_blocks_second_write(self):
+        td, root, before, index_before, hook = self._scenario()
+        with td:
+            real_write = fsops.write_target
+            calls = {"n": 0}
+
+            def guarded(op, target, content):
+                calls["n"] += 1
+                if calls["n"] == 2:
+                    Path(target).unlink()
+                    Path(target).mkdir()  # file -> directory type swap
+                return real_write(op, target, content)
+
+            with mock.patch(
+                "paper_notes.deletion.fsops.write_target", side_effect=guarded
+            ):
+                with self.assertRaises(items.ItemConflict):
+                    confirm(root, get_token(root), hook=hook)
+            self.assertEqual(vault_manifest(root), before)
+            lib, al = index_paths(root)
+            self.assertEqual(lib.read_bytes(), index_before[2])  # first output undone
+            self.assertTrue(al.is_dir())  # external type swap preserved
+            hook.assert_not_called()
+            self.assertFalse(workdir(root).exists())
+            self.assertFalse((root / ".paper-notes" / "write.lock").exists())
+            self.assertEqual(staging_residue(root), [])
+
+    def test_finalization_conflict_rolls_back_item_and_indexes(self):
+        """Deletion finalization conflict: an external racer appears at
+        an index path after the clean verdict (caught by the final
+        authority) — the item AND both index files roll back to their
+        exact bytes+mode, the racer survives at a named recovery
+        location, and the hook never fires."""
+        td, root, before, index_before, hook = self._scenario()
+        with td:
+            racer_bytes = b"external edit of library.json at finalization"
+            lib, al = index_paths(root)
+            real_verdict = deletion._commit_verdict
+
+            def verdict_then_index_racer(op):
+                verdict = real_verdict(op)  # clean
+                self.assertEqual(verdict, [])
+                lib.write_bytes(racer_bytes)  # racer lands on an index target
+                return verdict
+
+            with mock.patch(
+                "paper_notes.deletion._commit_verdict",
+                side_effect=verdict_then_index_racer,
+            ):
+                with self.assertRaises(items.ItemConflict) as ctx:
+                    confirm(root, get_token(root), hook=hook)
+
+            self.assertIn("library.json", str(ctx.exception))
+            hook.assert_not_called()
+            self.assertEqual(vault_manifest(root), before)
+            assert_index_restored(self, root, index_before)
+            self.assertFalse(workdir(root).exists())
+            self.assertFalse((root / ".paper-notes" / "write.lock").exists())
+            self.assertEqual(staging_residue(root), [])
+            # the racer bytes survive untouched inside the vault
+            racer_paths = [
+                p
+                for p in (root / ".paper-notes" / "recovery").rglob("*")
+                if p.is_file() and p.read_bytes() == racer_bytes
+            ]
+            self.assertEqual(len(racer_paths), 1)
+            self.assertTrue(racer_paths[0].resolve().is_relative_to(root.resolve()))
+
+    def test_prepare_failure_rolls_back_item_and_indexes(self):
+        td, root, before, index_before, hook = self._scenario()
+        with td:
+            with mock.patch.object(
+                deletion.IndexParticipant,
+                "prepare",
+                side_effect=RuntimeError("simulated prepare failure"),
+            ):
+                with self.assertRaises(items.ItemError):
+                    confirm(root, get_token(root), hook=hook)
+            self.assertEqual(vault_manifest(root), before)
+            assert_index_restored(self, root, index_before)
+            hook.assert_not_called()
+            self.assertFalse(workdir(root).exists())
+            self.assertFalse((root / ".paper-notes" / "write.lock").exists())
+            self.assertEqual(staging_residue(root), [])
+
+    def test_commit_failure_rolls_back_item_and_indexes(self):
+        td, root, before, index_before, hook = self._scenario()
+        with td:
+            with mock.patch.object(
+                deletion.IndexParticipant,
+                "commit",
+                side_effect=RuntimeError("simulated commit failure"),
+            ):
+                with self.assertRaises(items.ItemError):
+                    confirm(root, get_token(root), hook=hook)
+            self.assertEqual(vault_manifest(root), before)
+            assert_index_restored(self, root, index_before)
+            hook.assert_not_called()
+            self.assertFalse(workdir(root).exists())
+            self.assertFalse((root / ".paper-notes" / "write.lock").exists())
+            self.assertEqual(staging_residue(root), [])
+
+    def test_finalize_failure_rolls_back_item_and_indexes(self):
+        td, root, before, index_before, hook = self._scenario()
+        with td:
+            with mock.patch.object(
+                deletion.IndexParticipant,
+                "finalize",
+                side_effect=RuntimeError("simulated finalize failure"),
+            ):
+                with self.assertRaises(items.ItemError):
+                    confirm(root, get_token(root), hook=hook)
+            self.assertEqual(vault_manifest(root), before)
+            assert_index_restored(self, root, index_before)
+            hook.assert_not_called()
+            self.assertFalse(workdir(root).exists())
+            self.assertFalse((root / ".paper-notes" / "write.lock").exists())
+            self.assertEqual(staging_residue(root), [])
+
+
+class RecoverySeamTest(unittest.TestCase):
+    """Frozen repair-R3 regressions at the racer->recovery seam: the
+    dirfd-anchored no-replace move preserves a file that appears at the
+    recovery destination after its last check (seed bytes untouched,
+    racer lands at a fresh in-vault path), and a recovery parent
+    swapped to an outside symlink after the last check receives zero
+    outside writes."""
+
+    def test_late_recovery_destination_file_lands_at_fresh_invault_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            make_vault(root)
+            before = vault_manifest(root)
+            seed_index(root)
+            original_note = note(root, OLD).read_bytes()
+            hook = mock.Mock()
+            work = workdir(root)
+            racer_content = b"external racer: reappeared at a deleted target"
+            seed_content = b"seed bytes: pre-existing recovery material must survive"
+            real_commit = fsops.commit
+            real_move = fsops.no_replace_move
+            seeded_at = []
+            recovery_base = root / ".paper-notes" / "recovery"
+
+            def seed_then_racer(op):
+                target = next(
+                    t
+                    for t in op.targets
+                    if work in t.parents and t.name == f"{OLD}.md"
+                )
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(racer_content)
+                return real_commit(op)
+
+            def seed_dest_then_move(src, dst, **kw):
+                dst = Path(dst)
+                if dst.is_relative_to(recovery_base) and not seeded_at:
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    dst.write_bytes(seed_content)  # appears after the last check
+                    seeded_at.append(dst)
+                return real_move(src, dst, **kw)
+
+            with mock.patch(
+                "paper_notes.deletion.fsops.commit", side_effect=seed_then_racer
+            ), mock.patch(
+                "paper_notes.deletion.fsops.no_replace_move", side_effect=seed_dest_then_move
+            ):
+                with self.assertRaises(items.ItemConflict) as ctx:
+                    confirm(root, get_token(root), hook=hook)
+
+            self.assertIn(f"{OLD}.md", str(ctx.exception))
+            hook.assert_not_called()
+            self.assertEqual(vault_manifest(root), before)
+            self.assertEqual(note(root, OLD).read_bytes(), original_note)
+            self.assertFalse(workdir(root).exists())
+            self.assertFalse((root / ".paper-notes" / "write.lock").exists())
+            self.assertEqual(staging_residue(root), [])
+            # seed bytes unchanged at their exact path
+            self.assertEqual(seeded_at[0].read_bytes(), seed_content)
+            # the racer landed at a DIFFERENT in-vault recovery path
+            racer_paths = [
+                p
+                for p in recovery_base.rglob("*")
+                if p.is_file() and p.read_bytes() == racer_content
+            ]
+            self.assertEqual(len(racer_paths), 1)
+            self.assertNotEqual(racer_paths[0], seeded_at[0])
+            self.assertTrue(racer_paths[0].resolve().is_relative_to(root.resolve()))
+
+    def test_recovery_parent_symlink_swap_zero_outside_writes(self):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as otd:
+            outside = Path(otd)
+            root = Path(td)
+            make_vault(root)
+            before = vault_manifest(root)
+            seed_index(root)
+            original_note = note(root, OLD).read_bytes()
+            hook = mock.Mock()
+            work = workdir(root)
+            racer_content = b"external racer: must never leave the vault"
+            real_commit = fsops.commit
+            real_move = fsops.no_replace_move
+            swapped = {"n": 0}
+            recovery_base = root / ".paper-notes" / "recovery"
+
+            def racer_at_commit(op):
+                target = next(
+                    t
+                    for t in op.targets
+                    if work in t.parents and t.name == f"{OLD}.md"
+                )
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(racer_content)
+                return real_commit(op)
+
+            def swap_parent_then_move(src, dst, **kw):
+                dst = Path(dst)
+                if dst.is_relative_to(recovery_base) and not swapped["n"]:
+                    swapped["n"] = 1
+                    parent = dst.parent
+                    os.replace(parent, parent.parent / f"{parent.name}.real")
+                    parent.symlink_to(outside, target_is_directory=True)
+                return real_move(src, dst, **kw)
+
+            with mock.patch(
+                "paper_notes.deletion.fsops.commit", side_effect=racer_at_commit
+            ), mock.patch(
+                "paper_notes.deletion.fsops.no_replace_move",
+                side_effect=swap_parent_then_move,
+            ):
+                with self.assertRaises(items.ItemConflict) as ctx:
+                    confirm(root, get_token(root), hook=hook)
+
+            self.assertIn(f"{OLD}.md", str(ctx.exception))
+            hook.assert_not_called()
+            self.assertEqual(vault_manifest(root), before)
+            self.assertEqual(note(root, OLD).read_bytes(), original_note)
+            self.assertFalse(workdir(root).exists())
+            self.assertFalse((root / ".paper-notes" / "write.lock").exists())
+            self.assertEqual(staging_residue(root), [])
+            # zero outside writes; planted symlink untouched
+            self.assertEqual(sorted(os.listdir(outside)), [])
+            symlinks = [p for p in recovery_base.iterdir() if p.is_symlink()]
+            self.assertEqual(len(symlinks), 1)
+            self.assertEqual(os.readlink(symlinks[0]), str(outside))
+            # the racer was preserved INSIDE the vault at a fresh path
+            racer_paths = [
+                p
+                for p in recovery_base.rglob("*")
+                if p.is_file() and p.read_bytes() == racer_content
+            ]
             self.assertEqual(len(racer_paths), 1)
             self.assertTrue(racer_paths[0].resolve().is_relative_to(root.resolve()))
 

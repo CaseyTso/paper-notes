@@ -101,7 +101,6 @@ from .citations import (
     _global_md_manifest,
     _link_state,
     _read_text,
-    _rename_dir_noreplace,
     _scan_item_subtree,
     _stage_expected,
     _verify_subtree,
@@ -560,14 +559,19 @@ def _abort(
     plan: DeletePlan,
     item_dir: Path,
     work_dir: Path,
+    participant: "IndexParticipant | None" = None,
 ) -> None:
     """Roll back the staged operation and restore the item directory
     according to the phase, using no-replace renames only. Directories
     already removed by the deletion loop are recreated (shallowest
     first) with their recorded modes before the staged files are
-    restored into them. Nested rollback/restore failures are sanitized;
-    a refused restore (racer at the original path) surfaces as its own
-    ItemConflict.
+    restored into them. The citation-index participant is aborted
+    BEFORE the staged operation is rolled back: an index file edited
+    externally is moved to the recovery area and restored from its
+    staged backup first (``fsops.rollback`` alone would preserve it as
+    an unrecoverable conflict). Nested rollback/restore failures are
+    sanitized; a refused restore (racer at the original path) surfaces
+    as its own ItemConflict.
 
     A committed operation is never rolled back: commit already
     finalized the deletion (the staged snapshots were consumed), so the
@@ -589,10 +593,15 @@ def _abort(
                     # directory FileStates always carry their lstat mode
                     os.chmod(p, state.mode if state.mode is not None else 0o755)
         if op is not None and not committed:
+            if participant is not None:
+                participant.abort(op)
             fsops.rollback(op)
         if phase == "work":
+            assert op is not None  # the work phase only runs after the op exists
             try:
-                _rename_dir_noreplace(work_dir, item_dir)
+                _rename_dir_noreplace(
+                    work_dir, item_dir, vault_root=op.vault_root
+                )
             except ItemConflict:
                 raise ItemConflict(
                     "concurrent change detected while deleting item: "
@@ -604,6 +613,30 @@ def _abort(
         raise
     except Exception:
         raise ItemError("item deletion failed while rolling back") from None
+
+
+def _rename_dir_noreplace(source: Path, target: Path, *, vault_root: Path) -> None:
+    """dirfd-anchored atomic no-replace directory move (R3 primitive).
+
+    Delegates to :func:`paper_notes.fsops.no_replace_move` (dirfd
+    anchored, ``renameatx_np RENAME_EXCL``): both parents are anchored
+    as O_NOFOLLOW directory fds opened component by component from the
+    vault root, so a parent path swapped for an outside symlink after
+    the last path check can never redirect the rename outside the
+    vault. An existing target (file, directory or symlink) is never
+    replaced — :class:`MoveTargetExists` surfaces as an
+    :class:`ItemConflict` so the caller can preserve the racer; a
+    missing / wrong-type source or an unsupported platform surfaces as
+    :class:`ItemError` via the generic handler.
+    """
+    try:
+        fsops.no_replace_move(
+            source, target, vault_root=vault_root, source_kind="dir"
+        )
+    except fsops.MoveTargetExists:
+        raise ItemConflict(
+            "concurrent change detected: target appeared before the rename"
+        ) from None
 
 
 def _commit_verdict(op: fsops.StagedOperation) -> list[Path]:
@@ -700,8 +733,8 @@ def _ensure_real_dir_chain(p: Path, vault: Path) -> Path | None:
     return p
 
 
-def _recovery_dest(op: fsops.StagedOperation, rel: Path) -> Path:
-    """Boundary-checked, no-replace recovery destination inside the vault.
+def _recovery_candidates(op: fsops.StagedOperation, rel: Path):
+    """Yield boundary-checked, no-replace recovery destinations.
 
     Tries the nominal ``.paper-notes/recovery/<operation>/<rel>`` and,
     when any existing component of that path is a symlink or a
@@ -709,9 +742,12 @@ def _recovery_dest(op: fsops.StagedOperation, rel: Path) -> Path:
     exists (pre-seeded recovery material that must never be
     overwritten, deleted or rewritten), falls back to fresh real
     directories under the recovery area (then directly under
-    ``.paper-notes``). The racer is therefore always preserved inside
-    the vault and the outside directory receives zero writes; the
-    destination is re-verified right before it is used."""
+    ``.paper-notes``). Each candidate is re-verified right before it is
+    returned; the caller re-checks on every retry (a destination that
+    appeared after the last check conflicts and the next candidate is
+    taken). The racer is therefore always preserved inside the vault
+    and the outside directory receives zero writes.
+    """
     vault = op.vault_root
     base = vault / LOCK_DIR / _RECOVERY_SUBDIR
     candidates: list[Path] = [base / op.operation_id]
@@ -729,38 +765,7 @@ def _recovery_dest(op: fsops.StagedOperation, rel: Path) -> Path:
             continue  # symlink / non-directory in the chain: never follow
         if dest.exists() or dest.is_symlink():
             continue  # re-verify immediately before use
-        return dest
-    raise ItemConflict(
-        "concurrent change detected while deleting item: the recovery "
-        "area cannot be secured, so the racer was left in place"
-    )
-
-
-def _reappeared_targets(
-    op: fsops.StagedOperation,
-    plan: DeletePlan,
-    item_dir: Path,
-    work_dir: Path,
-) -> list[Path]:
-    """Every deleted path that exists again after the commit verdict.
-
-    The deletion removed every staged file target, every subtree
-    directory (deepest-first, the work directory itself included);
-    anything that reappeared at one of those paths after the verdict is
-    an external racer that must be preserved and reported — never
-    adopted, never deleted, and never silently left behind in a
-    ``deleted`` result."""
-    conflicts: list[Path] = []
-    for target in sorted(op.targets, key=str):
-        if target.exists() or target.is_symlink():
-            conflicts.append(target)
-    for state in plan.subtree:
-        if state.type != "dir":
-            continue
-        p = work_dir / state.path.relative_to(item_dir)
-        if p.exists() or p.is_symlink():
-            conflicts.append(p)
-    return sorted(set(conflicts), key=str)
+        yield dest
 
 
 def _remove_staging(op: fsops.StagedOperation) -> None:
@@ -785,27 +790,194 @@ def _preserve_racers(
     never overwritten, deleted, or silently adopted as the deletion
     baseline.
 
-    The destination is resolved with lstat boundary checks on every
-    path component (never through a symlink, never outside the vault)
-    and with no-replace semantics: existing recovery material is never
-    overwritten, deleted or rewritten — a colliding racer is preserved
-    at a fresh in-vault location instead (reported). Racer directories
-    are moved whole; racer files are preserved deepest-first so a file
-    keeps its flat named recovery path even when a containing directory
-    reappeared too."""
+    The move itself is the dirfd-anchored atomic no-replace primitive
+    (``paper_notes.fsops.no_replace_move``): the destination is
+    re-verified right before the rename and an existing destination —
+    file, directory or symlink, including one that appeared after the
+    last check — is never replaced; the next candidate recovery path is
+    taken instead (seed bytes stay untouched, the racer lands at a
+    fresh in-vault path). A recovery parent swapped to an outside
+    symlink after the last check receives zero outside writes. Racer
+    directories are moved whole; racer files are preserved
+    deepest-first so a file keeps its flat named recovery path even
+    when a containing directory reappeared too.
+    """
     recovered: list[tuple[Path, Path]] = []
     for target in sorted(
         conflicts, key=lambda p: (len(p.parts), str(p)), reverse=True
     ):
         if not target.exists() and not target.is_symlink():
             continue  # vanished again (moved with a preserved directory)
-        rel = (
-            Path(work_dir.name) if target == work_dir else target.relative_to(work_dir)
-        )
-        dest = _recovery_dest(op, rel)
-        os.replace(target, dest)
-        recovered.append((target, dest))
+        if target == work_dir:
+            rel = Path(work_dir.name)
+        elif work_dir in target.parents:
+            rel = target.relative_to(work_dir)
+        else:
+            # an index target (e.g. .paper-notes/library.json): keep
+            # the flat file name under the recovery area
+            rel = Path(target.name)
+        moved = False
+        for dest in _recovery_candidates(op, rel):
+            try:
+                fsops.no_replace_move(
+                    target, dest, vault_root=op.vault_root, source_kind="any"
+                )
+            except (fsops.MoveTargetExists, fsops.NoReplaceMoveError):
+                continue  # destination appeared / parent compromised: next one
+            recovered.append((target, dest))
+            moved = True
+            break
+        if not moved:
+            raise ItemConflict(
+                "concurrent change detected while deleting item: the recovery "
+                "area cannot be secured, so the racer was left in place"
+            )
     return recovered
+
+
+def _final_conflicts(
+    op: fsops.StagedOperation,
+    plan: DeletePlan,
+    item_dir: Path,
+    work_dir: Path,
+) -> list[Path]:
+    """Final authority before the rebuild hook: the complete
+    expected-state detection over the whole transaction.
+
+    Every staged target must still match its expected fingerprint —
+    deleted paths must still be absent, both index writes must still be
+    exactly the managed bytes+mode — and every removed subtree
+    directory must still be absent. Anything else is an external racer
+    (or an escape) that must be preserved and reported; the hook fires
+    zero times and the whole transaction (item + both index files)
+    rolls back. This is the plain ``rebuild_hook`` success window: the
+    R2 ``_reappeared_targets`` clean check is gone.
+    """
+    conflicts = fsops.commit_detect(op)
+    for state in plan.subtree:
+        if state.type != "dir":
+            continue
+        p = work_dir / state.path.relative_to(item_dir)
+        if p.exists() or p.is_symlink():
+            conflicts.append(p)
+    return sorted(set(conflicts), key=str)
+
+
+class IndexParticipant:
+    """Minimal transactional citation-index writer (Task 15 seam).
+
+    Publishes the post-deletion citation index as part of the same
+    transaction as the item deletion: ``prepare`` reads
+    ``.paper-notes/library.json`` and ``.paper-notes/citation-aliases.json``
+    (when both exist — a vault without the index pair keeps the
+    pre-R3 deletion semantics), computes the state without the deleted
+    key / aliases / paper_id, and stages both files as managed targets;
+    ``commit`` writes both new states as staged managed writes (each
+    expected-state-guarded, so an external edit / chmod / type swap
+    between the two outputs conflicts and rolls everything back);
+    ``finalize`` runs after the clean final authority and before the
+    rebuild hook — a failure there also rolls the item AND both index
+    files back to their exact bytes+mode with the hook zero times. The
+    real ``library.json`` / ``citation-aliases.json`` writer (Task 15)
+    plugs in behind this seam.
+    """
+
+    def __init__(self, root: Path, plan: DeletePlan):
+        self._root = root
+        self._plan = plan
+        self._lib = root / LOCK_DIR / "library.json"
+        self._aliases = root / LOCK_DIR / "citation-aliases.json"
+        self._op: fsops.StagedOperation | None = None
+        self._active = False
+        self._lib_new = ""
+        self._aliases_new = ""
+
+    def prepare(self, op: fsops.StagedOperation) -> None:
+        """Read the current index, compute the post-deletion state and
+        stage both files as managed targets. A missing index pair makes
+        the participant inactive."""
+        self._op = op
+        if not (self._lib.exists() and self._aliases.exists()):
+            self._active = False
+            return
+        lib = json.loads(self._lib.read_text(encoding="utf-8"))
+        aliases = json.loads(self._aliases.read_text(encoding="utf-8"))
+        papers = {
+            k: v
+            for k, v in lib.get("papers", {}).items()
+            if k != self._plan.key and str(v) != self._plan.paper_id
+        }
+        new_aliases = {
+            k: v
+            for k, v in aliases.get("aliases", {}).items()
+            if v != self._plan.key
+        }
+        self._lib_new = (
+            json.dumps({"papers": papers}, sort_keys=True, indent=2) + "\n"
+        )
+        self._aliases_new = (
+            json.dumps({"aliases": new_aliases}, sort_keys=True, indent=2) + "\n"
+        )
+        fsops.stage_target(op, self._lib)
+        fsops.stage_target(op, self._aliases)
+        self._active = True
+
+    def commit(self) -> None:
+        """Write both index files as staged managed writes."""
+        if not self._active or self._op is None:
+            return
+        fsops.write_target(self._op, self._lib, self._lib_new)
+        fsops.write_target(self._op, self._aliases, self._aliases_new)
+
+    def finalize(self) -> None:
+        """Post-verdict publication window (Task 15 real-writer seam)."""
+        return None
+
+    def abort(self, op: fsops.StagedOperation) -> None:
+        """Restore both index files before ``fsops.rollback`` consumes
+        the staging backups.
+
+        ``fsops.rollback`` only restores a target whose current
+        fingerprint still equals the managed-write state; an index file
+        edited externally — even after its racer was already moved to
+        the recovery area — is preserved as a conflict and never
+        restored. ``abort`` therefore moves any external racer still
+        sitting at an index path to the recovery area (the same
+        boundary-checked no-replace candidate loop; the racer is never
+        overwritten) and then restores the staged backup directly
+        (bytes+mode, ``copy2``). Index files that still match the
+        managed write are left untouched for ``fsops.rollback``.
+        """
+        if not self._active or op is None:
+            return
+        for path in (self._lib, self._aliases):
+            staged = op.targets.get(path)
+            if staged is None or not staged.written:
+                continue
+            fingerprint = fsops._file_fingerprint(path)
+            if fingerprint == fsops._expected_fingerprint(staged):
+                continue  # still the managed write: fsops.rollback restores it
+            if fingerprint != fsops._FP_ABSENT_TUPLE:
+                # an external racer sits at the index path: preserve it
+                # at a fresh in-vault recovery location, never overwrite
+                moved = False
+                for dest in _recovery_candidates(op, Path(path.name)):
+                    try:
+                        fsops.no_replace_move(
+                            path,
+                            dest,
+                            vault_root=op.vault_root,
+                            source_kind="any",
+                        )
+                    except (fsops.MoveTargetExists, fsops.NoReplaceMoveError):
+                        continue  # destination appeared / parent compromised
+                    moved = True
+                    break
+                if not moved:
+                    continue  # cannot secure the racer: leave it untouched
+            if staged.existed:
+                assert staged.backup is not None
+                shutil.copy2(staged.backup, path)
 
 
 def _execute(root: Path, plan: DeletePlan, hook: Callable[[], None]) -> None:
@@ -814,6 +986,7 @@ def _execute(root: Path, plan: DeletePlan, hook: Callable[[], None]) -> None:
     op: fsops.StagedOperation | None = None
     committed = False
     phase = "pre"  # "pre" | "work"
+    participant: IndexParticipant | None = None
     try:
         # 0. exact global markdown scan-input manifest check before any
         #    mutation or staging: additions / deletions / edits / chmods
@@ -826,10 +999,17 @@ def _execute(root: Path, plan: DeletePlan, hook: Callable[[], None]) -> None:
 
         op = fsops.begin_operation(root, uuid.uuid4().hex)
 
+        # 0.7 citation-index participant: prepare reads the current
+        #     index, computes the post-deletion state and stages both
+        #     files as managed targets (a vault without the index pair
+        #     keeps the pre-R3 semantics: the participant is inactive)
+        participant = IndexParticipant(root, plan)
+        participant.prepare(op)
+
         # 1. atomic no-replace item -> hidden work directory: the real
         #    item is never exposed at the canonical path while its files
         #    are being removed
-        _rename_dir_noreplace(item_dir, work_dir)
+        _rename_dir_noreplace(item_dir, work_dir, vault_root=root)
         phase = "work"
 
         # 2. recheck the mapped subtree immediately after the move to
@@ -869,6 +1049,12 @@ def _execute(root: Path, plan: DeletePlan, hook: Callable[[], None]) -> None:
         #    back with the hook never fired
         _post_verify(root, plan)
 
+        # 5.5 publish both index files as staged managed writes: each
+        #     write is expected-state-guarded, so an external
+        #     edit/chmod/type swap between the two outputs conflicts and
+        #     the whole transaction (item + both index files) rolls back
+        participant.commit()
+
         # 6. commit verdict BEFORE the hook: the real fsops.commit
         #    conflict detection runs against a proxy operation (shared
         #    targets, throwaway staging), so the recovery material
@@ -879,14 +1065,17 @@ def _execute(root: Path, plan: DeletePlan, hook: Callable[[], None]) -> None:
         #    the rebuild hook never fires.
         verdict_conflicts = _commit_verdict(op)
 
-        # 6.5 post-verdict re-check: a racer reappearing at any deleted
-        #     path AFTER the clean verdict but BEFORE the hook is the
-        #     same commit conflict — preserved, reported, rolled back,
-        #     hook zero times (the deletion is never reported 'deleted'
-        #     with a racer left behind in the work directory)
+        # 6.5 final authority: the plain rebuild_hook success window.
+        #     A racer reappearing at any deleted path — or any index
+        #     target no longer matching the managed bytes+mode — AFTER
+        #     the clean verdict but BEFORE the hook is the same commit
+        #     conflict: preserved, reported, rolled back, hook zero
+        #     times (the deletion is never reported 'deleted' with a
+        #     racer left behind in the work directory, and the item
+        #     deletion and both index files' new state are only visible
+        #     together)
         conflicts = sorted(
-            set(verdict_conflicts)
-            | set(_reappeared_targets(op, plan, item_dir, work_dir)),
+            set(verdict_conflicts) | set(_final_conflicts(op, plan, item_dir, work_dir)),
             key=str,
         )
         if conflicts:
@@ -902,9 +1091,16 @@ def _execute(root: Path, plan: DeletePlan, hook: Callable[[], None]) -> None:
                 "concurrent change detected while deleting item: " + detail
             )
 
+        # 6.75 participant finalize: runs after the clean final
+        #     authority and before the rebuild hook — a failure here
+        #     rolls the item AND both index files back with the hook
+        #     zero times
+        participant.finalize()
+
         # 7. rebuild hook exactly once — only after the commit verdict
-        #    came back clean and no racer reappeared at a deleted path,
-        #    so every rollback path fires it zero times
+        #    came back clean, no racer reappeared at a deleted path and
+        #    the participant finalized, so every rollback path fires it
+        #    zero times
         hook()
 
         # 8. finalize the transaction (the verdict ran against a proxy,
@@ -916,17 +1112,17 @@ def _execute(root: Path, plan: DeletePlan, hook: Callable[[], None]) -> None:
         op._finished = True
         committed = True
     except fsops.OperationConflict:
-        _abort(op, committed, phase, plan, item_dir, work_dir)
+        _abort(op, committed, phase, plan, item_dir, work_dir, participant)
         raise ItemConflict("concurrent change detected while deleting item") from None
     except ItemError:
-        _abort(op, committed, phase, plan, item_dir, work_dir)
+        _abort(op, committed, phase, plan, item_dir, work_dir, participant)
         raise
     except ItemConflict:
-        _abort(op, committed, phase, plan, item_dir, work_dir)
+        _abort(op, committed, phase, plan, item_dir, work_dir, participant)
         raise
     except Exception:
-        _abort(op, committed, phase, plan, item_dir, work_dir)
+        _abort(op, committed, phase, plan, item_dir, work_dir, participant)
         raise ItemError("item deletion failed") from None
     except BaseException:
-        _abort(op, committed, phase, plan, item_dir, work_dir)
+        _abort(op, committed, phase, plan, item_dir, work_dir, participant)
         raise
