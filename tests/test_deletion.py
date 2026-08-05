@@ -134,7 +134,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from paper_notes import cli, deletion, fsops, items
+from paper_notes import cli, csl, deletion, fsops, items
 from paper_notes.repository import build_index
 
 REPO = Path(__file__).resolve().parents[1]
@@ -279,14 +279,23 @@ def index_paths(root):
 
 
 def seed_index(root, library=None, aliases=None):
-    """Seed the two mock citation-index files (the R3 transactional
-    participant's outputs) and return (lib, aliases, before_bytes,
+    """Seed the two mock citation-index files in the REAL Task 15
+    shapes (library.json = CSL-JSON array of entries, aliases = flat
+    old->current map) and return (lib, aliases, before_bytes,
     before_modes)."""
     lib, al = index_paths(root)
     lib.parent.mkdir(parents=True, exist_ok=True)
     lib.write_text(
         json.dumps(
-            library if library is not None else {"papers": {OTHER: "other-uuid"}},
+            library
+            if library is not None
+            else [
+                {
+                    "id": OTHER,
+                    "type": "article-journal",
+                    "title": "Other paper",
+                }
+            ],
             sort_keys=True,
             indent=2,
         )
@@ -295,7 +304,7 @@ def seed_index(root, library=None, aliases=None):
     )
     al.write_text(
         json.dumps(
-            aliases if aliases is not None else {"aliases": {}},
+            aliases if aliases is not None else {},
             sort_keys=True,
             indent=2,
         )
@@ -1180,8 +1189,20 @@ class TransactionSeamTest(unittest.TestCase):
             )
             lib, al, lib_b, al_b, lib_m, al_m = seed_index(
                 root,
-                library={"papers": {OLD: PAPER_ID, OTHER: "other-uuid"}},
-                aliases={"aliases": {ALIAS: OLD, "smithAlias": "smithExample2026"}},
+                library=[
+                    {
+                        "id": OLD,
+                        "type": "article-journal",
+                        "title": "Old paper",
+                        "author": [{"family": "Shiau", "given": "C."}],
+                    },
+                    {
+                        "id": OTHER,
+                        "type": "article-journal",
+                        "title": "Other paper",
+                    },
+                ],
+                aliases={ALIAS: OLD, "smithAlias": "smithExample2026"},
             )
             hook = mock.Mock()
             real_commit = deletion.IndexParticipant.commit
@@ -1210,10 +1231,11 @@ class TransactionSeamTest(unittest.TestCase):
             self.assertFalse(item(root, OLD).exists())
             self.assertFalse(item(root, OLD).is_symlink())
             self.assertEqual(
-                json.loads(lib.read_text()), {"papers": {OTHER: "other-uuid"}}
+                json.loads(lib.read_text()),
+                [{"id": OTHER, "type": "article-journal", "title": "Other paper"}],
             )
             self.assertEqual(
-                json.loads(al.read_text()), {"aliases": {"smithAlias": "smithExample2026"}}
+                json.loads(al.read_text()), {"smithAlias": "smithExample2026"}
             )
             # participant ran exactly once
             self.assertEqual(commits, [1])
@@ -1227,6 +1249,56 @@ class TransactionSeamTest(unittest.TestCase):
             self.assertFalse((root / ".paper-notes" / "write.lock").exists())
             self.assertEqual(staging_residue(root), [])
             self.assertFalse(workdir(root).exists())
+
+    def test_rebuild_then_delete_publishes_real_csl_index(self):
+        """Manager-approved Task 30A regression (red before the fix):
+        the authoritative writer csl.rebuild_indexes publishes
+        library.json as a whole-library CSL-JSON ARRAY and
+        citation-aliases.json as a flat old->current map. Deleting an
+        item AFTER a rebuild must keep both real shapes: the published
+        library stays a list of CSL entries (never the placeholder
+        {"papers": ...} / {"aliases": ...} dicts), the deleted key and
+        its aliases are gone, and the published bytes are byte-identical
+        to what a fresh csl.rebuild_indexes writes for the same
+        post-deletion state (a placeholder write-back would corrupt the
+        Pandoc input)."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            make_vault(root)
+            rebuilt = csl.rebuild_indexes(root)
+            self.assertEqual(rebuilt.papers, 3)
+            lib, al = index_paths(root)
+            # the seeded files really are the real writer's shapes
+            self.assertIsInstance(json.loads(lib.read_text()), list)
+            self.assertEqual(
+                json.loads(al.read_text()), {ALIAS: OLD}
+            )
+
+            hook = mock.Mock()
+            result = confirm(root, get_token(root), hook=hook)
+            self.assertEqual(result.status, "deleted")
+            hook.assert_called_once_with()
+
+            published_lib = json.loads(lib.read_text(encoding="utf-8"))
+            published_aliases = json.loads(al.read_text(encoding="utf-8"))
+            # real CSL-JSON shapes preserved — never the placeholder
+            # {"papers": ...} / {"aliases": ...} dicts
+            self.assertIsInstance(published_lib, list)
+            self.assertIsInstance(published_aliases, dict)
+            self.assertEqual(
+                {entry["id"] for entry in published_lib},
+                {OTHER, "smithExample2026"},
+            )
+            self.assertEqual(published_aliases, {})  # alias to OLD gone
+
+            # the participant's publication is byte-identical to the
+            # authoritative writer's deterministic output for the same
+            # post-deletion state: a fresh rebuild changes nothing
+            published_lib_bytes = lib.read_bytes()
+            published_aliases_bytes = al.read_bytes()
+            csl.rebuild_indexes(root)
+            self.assertEqual(lib.read_bytes(), published_lib_bytes)
+            self.assertEqual(al.read_bytes(), published_aliases_bytes)
 
     def test_racer_after_clean_verdict_conflicts_restores_item_and_indexes(self):
         """Clean verdict 后、旧 hook 前注入 hidden work-target racer:
@@ -1801,8 +1873,20 @@ class FinalAuthoritySeamTest(unittest.TestCase):
             )
             lib, al, lib_b, al_b, lib_m, al_m = seed_index(
                 root,
-                library={"papers": {OLD: PAPER_ID, OTHER: "other-uuid"}},
-                aliases={"aliases": {ALIAS: OLD, "smithAlias": "smithExample2026"}},
+                library=[
+                    {
+                        "id": OLD,
+                        "type": "article-journal",
+                        "title": "Old paper",
+                        "author": [{"family": "Shiau", "given": "C."}],
+                    },
+                    {
+                        "id": OTHER,
+                        "type": "article-journal",
+                        "title": "Other paper",
+                    },
+                ],
+                aliases={ALIAS: OLD, "smithAlias": "smithExample2026"},
             )
             scratch = root / LIT / "hook-scratch.md"
             scratch_bytes = b"# hook side effect\n"
@@ -1828,10 +1912,11 @@ class FinalAuthoritySeamTest(unittest.TestCase):
             self.assertEqual(finalizes, [1])
             self.assertFalse(item(root, OLD).exists())
             self.assertEqual(
-                json.loads(lib.read_text()), {"papers": {OTHER: "other-uuid"}}
+                json.loads(lib.read_text()),
+                [{"id": OTHER, "type": "article-journal", "title": "Other paper"}],
             )
             self.assertEqual(
-                json.loads(al.read_text()), {"aliases": {"smithAlias": "smithExample2026"}}
+                json.loads(al.read_text()), {"smithAlias": "smithExample2026"}
             )
             # the hook's own side effect is preserved untouched
             self.assertEqual(scratch.read_bytes(), scratch_bytes)
@@ -1870,8 +1955,20 @@ class CleanupFailureTest(unittest.TestCase):
         make_vault(root)
         index_before = seed_index(
             root,
-            library={"papers": {OLD: PAPER_ID, OTHER: "other-uuid"}},
-            aliases={"aliases": {ALIAS: OLD, "smithAlias": "smithExample2026"}},
+            library=[
+                {
+                    "id": OLD,
+                    "type": "article-journal",
+                    "title": "Old paper",
+                    "author": [{"family": "Shiau", "given": "C."}],
+                },
+                {
+                    "id": OTHER,
+                    "type": "article-journal",
+                    "title": "Other paper",
+                },
+            ],
+            aliases={ALIAS: OLD, "smithAlias": "smithExample2026"},
         )
         hook = mock.Mock()
         return td, root, index_before, hook
@@ -1879,11 +1976,12 @@ class CleanupFailureTest(unittest.TestCase):
     def _assert_published(self, root, index_before):
         lib, al = index_paths(root)
         self.assertEqual(
-            json.loads(lib.read_text()), {"papers": {OTHER: "other-uuid"}}
+            json.loads(lib.read_text()),
+            [{"id": OTHER, "type": "article-journal", "title": "Other paper"}],
         )
         self.assertEqual(
             json.loads(al.read_text()),
-            {"aliases": {"smithAlias": "smithExample2026"}},
+            {"smithAlias": "smithExample2026"},
         )
         self.assertEqual(stat.S_IMODE(lib.lstat().st_mode), stat.S_IMODE(index_before[4]))
         self.assertEqual(stat.S_IMODE(al.lstat().st_mode), stat.S_IMODE(index_before[5]))

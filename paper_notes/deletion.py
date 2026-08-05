@@ -1277,15 +1277,20 @@ def _final_conflicts(
 
 
 class IndexParticipant:
-    """Minimal transactional citation-index writer (Task 15 seam).
+    """Transactional citation-index writer for the real Task 15 shapes.
 
     Publishes the post-deletion citation index as part of the same
     transaction as the item deletion: ``prepare`` reads
-    ``.paper-notes/library.json`` and ``.paper-notes/citation-aliases.json``
-    (when both exist — a vault without the index pair keeps the
-    pre-R3 deletion semantics), computes the state without the deleted
-    key / aliases / paper_id, and stages both files as managed targets;
-    ``commit`` writes both new states as staged managed writes (each
+    ``.paper-notes/library.json`` (a whole-library CSL-JSON ARRAY, each
+    entry keyed by ``id``) and ``.paper-notes/citation-aliases.json``
+    (a flat old->current key map) — the exact shapes the authoritative
+    writer :func:`paper_notes.csl.rebuild_indexes` publishes — and
+    computes the state without the deleted key / its aliases. A
+    non-conforming file cannot be published safely (the placeholder
+    ``{"papers": ...}`` write-back would corrupt the Pandoc input), so
+    ``prepare`` raises and the whole transaction rolls back. A missing
+    index pair keeps the pre-R3 deletion semantics. ``commit`` writes
+    both new states as staged managed writes (each
     expected-state-guarded, so an external edit / chmod / type swap
     between the two outputs conflicts and rolls everything back);
     ``finalize`` is the merged final authority + legacy hook + success
@@ -1301,9 +1306,7 @@ class IndexParticipant:
     any pre-linearization point rolls the item AND both index files
     back to their exact bytes+mode with the hook zero times (a
     hook-time divergence fires it exactly once — the deletion itself is
-    never reported 'deleted'). The real ``library.json`` /
-    ``citation-aliases.json``
-    writer (Task 15) plugs in behind this seam.
+    never reported 'deleted').
     """
 
     def __init__(self, root: Path, plan: DeletePlan):
@@ -1319,28 +1322,46 @@ class IndexParticipant:
     def prepare(self, op: fsops.StagedOperation) -> None:
         """Read the current index, compute the post-deletion state and
         stage both files as managed targets. A missing index pair makes
-        the participant inactive."""
+        the participant inactive.
+
+        The real Task 15 shapes are the contract: ``library.json`` is a
+        whole-library CSL-JSON array (each entry keyed by ``id``) and
+        ``citation-aliases.json`` is a flat old->current key map. A
+        non-conforming file cannot be published safely — the
+        post-deletion state is undefined, so the participant raises
+        (``ItemError``) and the transaction rolls back instead of
+        overwriting the Pandoc input with a placeholder shape.
+        """
         self._op = op
         if not (self._lib.exists() and self._aliases.exists()):
             self._active = False
             return
         lib = json.loads(self._lib.read_text(encoding="utf-8"))
         aliases = json.loads(self._aliases.read_text(encoding="utf-8"))
-        papers = {
-            k: v
-            for k, v in lib.get("papers", {}).items()
-            if k != self._plan.key and str(v) != self._plan.paper_id
-        }
+        if not isinstance(lib, list):
+            raise ItemError("unexpected library.json: expected a CSL-JSON array")
+        if not isinstance(aliases, dict):
+            raise ItemError(
+                "unexpected citation-aliases.json: expected an alias map"
+            )
+        remaining = [
+            entry for entry in lib if entry.get("id") != self._plan.key
+        ]
         new_aliases = {
-            k: v
-            for k, v in aliases.get("aliases", {}).items()
-            if v != self._plan.key
+            alias: current
+            for alias, current in aliases.items()
+            if current != self._plan.key
         }
+        # deterministic serialization identical to csl.render_library /
+        # csl.render_alias_map, so the published bytes match a fresh
+        # rebuild of the same post-deletion state byte-for-byte
         self._lib_new = (
-            json.dumps({"papers": papers}, sort_keys=True, indent=2) + "\n"
+            json.dumps(remaining, ensure_ascii=False, indent=2, sort_keys=True)
+            + "\n"
         )
         self._aliases_new = (
-            json.dumps({"aliases": new_aliases}, sort_keys=True, indent=2) + "\n"
+            json.dumps(new_aliases, ensure_ascii=False, indent=2, sort_keys=True)
+            + "\n"
         )
         fsops.stage_target(op, self._lib)
         fsops.stage_target(op, self._aliases)
