@@ -1,0 +1,4 @@
+# Fixture PDFs are migration-discovery test inputs for the v0.1
+# vertical slice; they must be tracked even though the repository
+# root ignores *.pdf.
+!*.pdf
