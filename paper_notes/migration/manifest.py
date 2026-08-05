@@ -131,7 +131,10 @@ def _transformations(
             "path": item.main_note.as_posix(),
             "remove": remove,
             "set": updates,
-            "add": {"paper_id": PAPER_ID_PLACEHOLDER},
+            # schema_version must land in the raw frontmatter, not only
+            # via Pydantic's default at parse time (the plugin index keys
+            # on the declared schema; spec §6).
+            "add": {"paper_id": PAPER_ID_PLACEHOLDER, "schema_version": 1},
         }
     ]
 

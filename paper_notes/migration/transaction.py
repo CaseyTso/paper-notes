@@ -344,7 +344,11 @@ def _transform_main_note(
             frontmatter.pop(name, None)
         frontmatter["citation_key"] = key
         frontmatter["paper_id"] = paper_id
-        frontmatter["schema_version"] = 1
+    # A canonical main item always declares the schema explicitly (spec
+    # §6); Pydantic's default would mask a missing field and the plugin
+    # index rejects items without schema_version. Forcing it here is
+    # defense in depth for manifests built before the plan carried it.
+    frontmatter["schema_version"] = 1
     Paper(**dict(frontmatter))  # raises ValidationError when non-canonical
     return _serialize_rt(frontmatter, body, newline)
 

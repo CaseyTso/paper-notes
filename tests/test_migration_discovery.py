@@ -160,6 +160,9 @@ class DiscoveryTest(unittest.TestCase):
         self.assertEqual(tf["set"]["pdf_status"], "available")
         self.assertEqual(tf["set"]["reading_status"], "read")
         self.assertIn("paper_id", tf["add"])
+        # the canonical main note must carry schema_version in the plan
+        # itself, not only via Pydantic defaults at parse time
+        self.assertEqual(tf["add"]["schema_version"], 1)
 
     def test_reading_status_mapping(self):
         self.assertEqual(

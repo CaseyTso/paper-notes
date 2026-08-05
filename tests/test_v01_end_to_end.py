@@ -245,6 +245,10 @@ class V01VerticalSliceTest(unittest.TestCase):
         self.assertEqual(paper.pdf_status, "available")
         # legacy fields are gone from the canonical note
         text = note.read_text(encoding="utf-8")
+        # raw frontmatter must declare the schema explicitly (the plugin
+        # index keys on it); paper.schema_version alone is a Pydantic
+        # default and would hide a missing field.
+        self.assertIn("schema_version: 1", text)
         self.assertNotIn("zotero", text)
         self.assertNotIn("状态", text)
         self.assertNotIn("citation key:", text)

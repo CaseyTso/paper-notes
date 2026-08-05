@@ -186,6 +186,16 @@ class MigrationTransactionTest(unittest.TestCase):
         self.assertEqual(str(paper.paper_id), by_key[SHIAU])
         self.assertEqual(paper.schema_version, 1)
 
+    def test_migrated_main_note_raw_frontmatter_has_schema_version(self):
+        # raw YAML must carry schema_version: 1 (plugin index relies on it);
+        # asserting only paper.schema_version would pass via the Pydantic
+        # default even when the frontmatter omits the field.
+        result = self.apply()
+        for m in result.migrated:
+            main = self.target_dir(m["citation_key"]) / f"{m['citation_key']}.md"
+            text = main.read_text(encoding="utf-8")
+            self.assertIn("schema_version: 1", text)
+
     def test_old_active_zotero_fields_removed(self):
         self.apply()
         fm = _frontmatter_dict(self.target_dir(SHIAU) / f"{SHIAU}.md")
