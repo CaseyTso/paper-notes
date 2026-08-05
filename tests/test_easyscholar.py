@@ -1,10 +1,17 @@
-"""EasyScholar query adapter tests (Task 16).
+"""EasyScholar query adapter tests (Task 16 + R11 upstream migration).
 
 Frozen after the first red run; do not weaken or delete assertions.
 All HTTP is mocked — no live request is ever made and no real secret
 exists. The secret is a synthetic marker assembled at runtime. The
 adapter returns stable normalized metric fields and must never write
 to Markdown or leak the secret in errors/output.
+
+R11 (2026-08): the upstream ``/openInfo/getSearchData`` endpoint was
+retired and now serves the SPA homepage. The migrated public endpoint
+is ``/open/getPublicationRank`` (secretKey + publicationName; success
+``code == 200``; metrics live in ``data.officialRank.all``). The tests
+below pin that migrated contract and assert the legacy payload shape
+is rejected (reverse injection stays red).
 """
 
 import hashlib
@@ -23,29 +30,32 @@ REPO = Path(__file__).resolve().parents[1]
 SECRET = "sk-" + "easyscholar-" + "test-secret-1234567890"
 
 RAW_PAYLOAD = {
-    "code": 0,
-    "msg": "成功",
-    "data": [
-        {
-            "name": "Nature Medicine",
-            "abbreviation": "Nat Med",
-            "level": "SCI",
-            "issn": "1078-8956",
-            "sciif": "82.9",
-            "sciif5": "83.2",
-            "jci": "8.11",
-            "jcr": "Q1",
-            "cas": "1区",
-        }
-    ],
+    "code": 200,
+    "msg": "SUCCESS",
+    "data": {
+        "customRank": {"rankInfo": [], "rank": []},
+        "officialRank": {
+            "all": {
+                "sciif": "82.9",
+                "jci": "8.11",
+                "sciwarn": "中科院预警",
+            },
+            "select": {
+                "sci": "Q1",
+                "sciif5": "83.2",
+                "sciBase": "1区",
+                "sciUp": "1区",
+            },
+        },
+    },
 }
 
 EXPECTED_NORMALIZED = {
     "source": "easyscholar",
     "journal": "Nature Medicine",
-    "abbreviation": "Nat Med",
-    "issn": "1078-8956",
-    "level": "SCI",
+    "abbreviation": None,
+    "issn": None,
+    "level": None,
     "metrics": {
         "if": 82.9,
         "if5": 83.2,
@@ -77,14 +87,18 @@ class QueryTest(unittest.TestCase):
         get.assert_called_once()
         params = get.call_args.kwargs["params"]
         self.assertEqual(params["secretKey"], SECRET)
-        self.assertEqual(params["scienceName"], "Nature Medicine")
-
-    def test_query_by_issn(self):
-        with mock.patch.object(easyscholar.requests, "get", return_value=_json_response(RAW_PAYLOAD)) as get:
-            easyscholar.EasyScholarAdapter(SECRET).query(issn="1078-8956")
-        params = get.call_args.kwargs["params"]
-        self.assertEqual(params["issn"], "1078-8956")
+        self.assertEqual(params["publicationName"], "Nature Medicine")
         self.assertNotIn("scienceName", params)
+
+    def test_issn_only_raises_clear_error_without_request(self):
+        # The migrated upstream endpoint accepts publicationName only;
+        # an ISSN-only lookup is rejected locally, before any HTTP call.
+        with mock.patch.object(easyscholar.requests, "get") as get:
+            with self.assertRaises(easyscholar.EasyScholarError) as ctx:
+                easyscholar.EasyScholarAdapter(SECRET).query(issn="1078-8956")
+        self.assertNotIn(SECRET, str(ctx.exception))
+        self.assertIn("publicationName", str(ctx.exception))
+        get.assert_not_called()
 
     def test_query_requires_journal_or_issn(self):
         with self.assertRaises(ValueError):
@@ -99,14 +113,14 @@ class QueryTest(unittest.TestCase):
         self.assertNotIn(SECRET, str(ctx.exception))
 
     def test_invalid_credentials_raise_nonzero_error(self):
-        payload = {"code": 4002, "msg": "invalid secret key", "data": None}
+        payload = {"code": 40002, "msg": "Key错误", "data": None}
         with mock.patch.object(easyscholar.requests, "get", return_value=_json_response(payload)):
             with self.assertRaises(easyscholar.EasyScholarError) as ctx:
                 easyscholar.EasyScholarAdapter(SECRET).query(journal="Nature Medicine")
         self.assertNotIn(SECRET, str(ctx.exception))
 
     def test_rate_limit_raises_nonzero_error(self):
-        payload = {"code": 4003, "msg": "request too frequent", "data": None}
+        payload = {"code": 40003, "msg": "请求过于频繁", "data": None}
         with mock.patch.object(easyscholar.requests, "get", return_value=_json_response(payload)):
             with self.assertRaises(easyscholar.EasyScholarError):
                 easyscholar.EasyScholarAdapter(SECRET).query(journal="Nature Medicine")
@@ -119,29 +133,44 @@ class QueryTest(unittest.TestCase):
             with self.assertRaises(easyscholar.EasyScholarError):
                 easyscholar.EasyScholarAdapter(SECRET).query(journal="Nature Medicine")
 
-    def test_empty_data_raises(self):
-        payload = {"code": 0, "msg": "成功", "data": []}
+    def test_all_bucket_empty_select_only_is_accepted(self):
+        # The migrated API splits metrics across officialRank.all and
+        # officialRank.select; a journal whose data lives only in
+        # ``select`` is still a match and must not be rejected.
+        payload = {
+            "code": 200,
+            "msg": "SUCCESS",
+            "data": {
+                "customRank": {"rankInfo": [], "rank": []},
+                "officialRank": {"all": {}, "select": {"sci": "Q1", "sciBase": "1区"}},
+            },
+        }
+        with mock.patch.object(easyscholar.requests, "get", return_value=_json_response(payload)):
+            result = easyscholar.EasyScholarAdapter(SECRET).query(journal="Journal X")
+        self.assertEqual(result["metrics"]["jcr_partition"], "Q1")
+        self.assertEqual(result["metrics"]["cas_partition"], "1区")
+
+    def test_empty_official_rank_raises(self):
+        payload = {
+            "code": 200,
+            "msg": "SUCCESS",
+            "data": {"customRank": {"rankInfo": [], "rank": []}, "officialRank": {"all": {}, "select": {}}},
+        }
         with mock.patch.object(easyscholar.requests, "get", return_value=_json_response(payload)):
             with self.assertRaises(easyscholar.EasyScholarError):
                 easyscholar.EasyScholarAdapter(SECRET).query(journal="No Such Journal")
 
     def test_non_numeric_metrics_become_none(self):
         payload = {
-            "code": 0,
-            "msg": "成功",
-            "data": [
-                {
-                    "name": "Journal X",
-                    "abbreviation": None,
-                    "level": None,
-                    "issn": None,
-                    "sciif": "n/a",
-                    "sciif5": "",
-                    "jci": None,
-                    "jcr": None,
-                    "cas": None,
-                }
-            ],
+            "code": 200,
+            "msg": "SUCCESS",
+            "data": {
+                "customRank": {"rankInfo": [], "rank": []},
+                "officialRank": {
+                    "all": {"sciif": "n/a", "jci": None},
+                    "select": {"sciif5": "", "sci": None, "sciBase": None},
+                },
+            },
         }
         with mock.patch.object(easyscholar.requests, "get", return_value=_json_response(payload)):
             result = easyscholar.EasyScholarAdapter(SECRET).query(journal="Journal X")
@@ -158,6 +187,30 @@ class QueryTest(unittest.TestCase):
         self.assertIsNone(result["abbreviation"])
         self.assertIsNone(result["issn"])
 
+    def test_legacy_payload_shape_is_rejected(self):
+        # Reverse injection: the retired /openInfo/getSearchData contract
+        # (code==0 with a data list) must NOT be accepted as a success.
+        legacy = {
+            "code": 0,
+            "msg": "成功",
+            "data": [
+                {
+                    "name": "Nature Medicine",
+                    "abbreviation": "Nat Med",
+                    "level": "SCI",
+                    "issn": "1078-8956",
+                    "sciif": "82.9",
+                    "sciif5": "83.2",
+                    "jci": "8.11",
+                    "jcr": "Q1",
+                    "cas": "1区",
+                }
+            ],
+        }
+        with mock.patch.object(easyscholar.requests, "get", return_value=_json_response(legacy)):
+            with self.assertRaises(easyscholar.EasyScholarError):
+                easyscholar.EasyScholarAdapter(SECRET).query(journal="Nature Medicine")
+
     def test_request_transport_error_raises(self):
         import requests
 
@@ -168,7 +221,7 @@ class QueryTest(unittest.TestCase):
                 easyscholar.EasyScholarAdapter(SECRET).query(journal="Nature Medicine")
 
     def test_api_msg_echoing_secret_is_redacted(self):
-        payload = {"code": 4002, "msg": "invalid secret key " + SECRET, "data": None}
+        payload = {"code": 40002, "msg": "invalid secret key " + SECRET, "data": None}
         with mock.patch.object(
             easyscholar.requests, "get", return_value=_json_response(payload)
         ):
@@ -182,7 +235,7 @@ class QueryTest(unittest.TestCase):
         import traceback
 
         cause = requests.ConnectionError(
-            "failed: https://www.easyscholar.cc/openInfo/getSearchData?secretKey="
+            "failed: https://www.easyscholar.cc/open/getPublicationRank?secretKey="
             + SECRET
         )
         with mock.patch.object(easyscholar.requests, "get", side_effect=cause):
@@ -253,7 +306,7 @@ class MetricsCliTest(unittest.TestCase):
     def test_metrics_query_success_json(self):
         with mock.patch.object(
             easyscholar.requests, "get", return_value=_json_response(RAW_PAYLOAD)
-        ):
+        ) as get:
             rc, out = self._run(
                 "metrics", "query", "--journal", "Nature Medicine", "--issn", "1078-8956"
             )
@@ -263,7 +316,11 @@ class MetricsCliTest(unittest.TestCase):
         metrics = payload["data"]["metrics"]
         self.assertEqual(metrics["journal"], "Nature Medicine")
         self.assertEqual(metrics["metrics"]["jcr_partition"], "Q1")
+        self.assertEqual(metrics["metrics"]["cas_partition"], "1区")
         self.assertNotIn(SECRET, out)
+        # The migrated endpoint is keyed by publicationName; a provided
+        # ISSN must not be forwarded (the upstream contract dropped it).
+        self.assertNotIn("issn", get.call_args.kwargs["params"])
 
     def test_metrics_query_without_key_is_nonzero(self):
         from paper_notes import config as cfgmod
@@ -276,7 +333,7 @@ class MetricsCliTest(unittest.TestCase):
         self.assertNotIn(SECRET, out)
 
     def test_metrics_query_error_is_nonzero_and_redacted(self):
-        payload = {"code": 4002, "msg": "invalid secret key", "data": None}
+        payload = {"code": 40002, "msg": "Key错误", "data": None}
         with mock.patch.object(
             easyscholar.requests, "get", return_value=_json_response(payload)
         ):

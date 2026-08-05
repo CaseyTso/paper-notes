@@ -1,11 +1,20 @@
 """Read-only EasyScholar metrics adapter.
 
-Queries the EasyScholar open-info search endpoint with the configured
-SecretKey and maps the first hit onto a stable normalized result shape
-(``source`` / ``journal`` / ``abbreviation`` / ``issn`` / ``level`` /
-``metrics``). Metrics are volatile UI data per design section 10: this
-adapter never writes to Markdown, never caches to disk, and never
-includes the secret in errors.
+Queries the EasyScholar open publication-rank endpoint with the configured
+SecretKey and maps the matched journal's official dataset onto a stable
+normalized result shape (``source`` / ``journal`` / ``abbreviation`` /
+``issn`` / ``level`` / ``metrics``). Metrics are volatile UI data per
+design section 10: this adapter never writes to Markdown, never caches to
+disk, and never includes the secret in errors.
+
+R11 (2026-08): the former ``/openInfo/getSearchData`` endpoint (query
+params ``scienceName`` / ``issn``, success ``code == 0``, ``data`` list)
+was retired and now serves the SPA homepage. The migrated public endpoint
+is ``/open/getPublicationRank`` (query params ``secretKey`` /
+``publicationName``, success ``code == 200``, metrics split across
+``data.officialRank.all`` and ``data.officialRank.select``). The migrated
+API does not accept an ISSN-only lookup, so such queries are rejected
+locally before any HTTP request.
 
 Nonzero API codes (invalid credentials, rate limits, …) raise
 :class:`EasyScholarError` so callers map them to nonzero exit codes.
@@ -23,7 +32,7 @@ import requests
 from paper_notes import config as _config
 from paper_notes.adapters import AdapterError
 
-API_URL = "https://www.easyscholar.cc/openInfo/getSearchData"
+API_URL = "https://www.easyscholar.cc/open/getPublicationRank"
 
 
 class EasyScholarError(AdapterError):
@@ -59,20 +68,31 @@ def _first_str(value: Any) -> str | None:
 
 
 def normalize(record: dict[str, Any], fallback_journal: str | None) -> dict[str, Any]:
-    """Map one EasyScholar record onto stable normalized fields."""
-    journal = _first_str(record.get("name")) or (fallback_journal or "")
+    """Map one EasyScholar ``officialRank.all`` record onto stable fields.
+
+    The migrated API reports official-dataset metrics across the
+    ``officialRank.all`` and ``officialRank.select`` buckets (merged by
+    the caller, ``all`` winning) keyed by names such as ``sciif`` /
+    ``sciif5`` / ``jci`` / ``sci`` / ``ssci`` / ``sciBase`` / ``sciUp``;
+    it no longer returns the legacy ``name`` / ``abbreviation``
+    / ``issn`` / ``level`` record fields, so those normalize to ``None``
+    and the queried journal name is carried through as the fallback.
+    """
+    journal = fallback_journal or ""
     return {
         "source": "easyscholar",
         "journal": journal,
-        "abbreviation": _first_str(record.get("abbreviation")),
-        "issn": _first_str(record.get("issn")),
-        "level": _first_str(record.get("level")),
+        "abbreviation": None,
+        "issn": None,
+        "level": None,
         "metrics": {
             "if": _to_float(record.get("sciif")),
             "if5": _to_float(record.get("sciif5")),
             "jci": _to_float(record.get("jci")),
-            "jcr_partition": _first_str(record.get("jcr")),
-            "cas_partition": _first_str(record.get("cas")),
+            "jcr_partition": _first_str(record.get("sci"))
+            or _first_str(record.get("ssci")),
+            "cas_partition": _first_str(record.get("sciBase"))
+            or _first_str(record.get("sciUp")),
         },
         "queried_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
     }
@@ -96,11 +116,19 @@ class EasyScholarAdapter:
             raise ValueError(
                 "EasyScholarAdapter.query requires journal or issn"
             )
-        params: dict[str, str] = {"secretKey": self.secret_key}
-        if journal:
-            params["scienceName"] = journal
-        if issn:
-            params["issn"] = issn
+        if not journal:
+            # The migrated endpoint keys lookups by publicationName only;
+            # an ISSN-only query cannot be expressed and is rejected
+            # locally so no HTTP request (or secret-bearing URL) is made.
+            raise EasyScholarError(
+                "easyscholar lookup requires a journal name "
+                "(publicationName); ISSN-only queries are not supported "
+                "by the migrated API"
+            )
+        params: dict[str, str] = {
+            "secretKey": self.secret_key,
+            "publicationName": journal,
+        }
         try:
             response = requests.get(API_URL, params=params, timeout=self.timeout)
         except requests.RequestException:
@@ -118,7 +146,7 @@ class EasyScholarAdapter:
         if not isinstance(payload, dict):
             raise EasyScholarError("easyscholar returned a non-object payload")
         code = payload.get("code")
-        if code != 0:
+        if code != 200:
             message = _first_str(payload.get("msg")) or "unknown error"
             # API messages can echo the credential back; redact every
             # outward-facing message before it reaches logs or the CLI.
@@ -128,12 +156,25 @@ class EasyScholarAdapter:
                 )
             )
         data = payload.get("data")
-        if not isinstance(data, list) or not data:
+        if not isinstance(data, dict):
+            raise EasyScholarError("easyscholar returned a malformed payload")
+        official = data.get("officialRank")
+        if not isinstance(official, dict):
             raise EasyScholarError("easyscholar returned no matching journal")
-        record = data[0]
-        if not isinstance(record, dict):
-            raise EasyScholarError("easyscholar returned a malformed record")
-        return normalize(record, journal)
+        all_rank = official.get("all")
+        select_rank = official.get("select")
+        if not isinstance(all_rank, dict) or not isinstance(select_rank, dict):
+            raise EasyScholarError("easyscholar returned a malformed payload")
+        # The migrated API splits the official dataset across two buckets:
+        # ``all`` carries sciif/jci/esi/… while ``select`` carries sci
+        # (JCR quartile), sciif5, and the CAS zones (sciBase/sciUp).
+        # ``all`` wins on conflicts; ``select`` fills the gaps. Either
+        # bucket being non-empty means the journal matched.
+        merged = dict(select_rank)
+        merged.update(all_rank)
+        if not merged:
+            raise EasyScholarError("easyscholar returned no matching journal")
+        return normalize(merged, journal)
 
 
 _PREF_RE = re.compile(r'user_pref\(\s*"([^"]+)"\s*,\s*"((?:[^"\\]|\\.)*)"\s*\)')

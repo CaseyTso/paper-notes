@@ -71,23 +71,18 @@ REAL_VAULT = os.environ.get("OBSIDIAN_VAULT_PATH") or (
     "/Users/juicewrld/Downloads/obsidian/知识库"
 )
 
-# Mocked EasyScholar open-info payload (shape mirrors the real API).
+# Mocked EasyScholar publication-rank payload (shape mirrors the migrated
+# /open/getPublicationRank API: code==200, metrics in officialRank.all).
 EASY_PAYLOAD = {
-    "code": 0,
-    "msg": "成功",
-    "data": [
-        {
-            "name": "Nature Medicine",
-            "abbreviation": "Nat Med",
-            "level": "SCI",
-            "issn": "1078-8956",
-            "sciif": "82.9",
-            "sciif5": "83.2",
-            "jci": "8.11",
-            "jcr": "Q1",
-            "cas": "1区",
-        }
-    ],
+    "code": 200,
+    "msg": "SUCCESS",
+    "data": {
+        "customRank": {"rankInfo": [], "rank": []},
+        "officialRank": {
+            "all": {"sciif": "82.9", "jci": "8.11"},
+            "select": {"sci": "Q1", "sciif5": "83.2", "sciBase": "1区"},
+        },
+    },
 }
 
 
