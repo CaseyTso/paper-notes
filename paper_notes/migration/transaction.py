@@ -341,6 +341,14 @@ def _transform_main_note(
             frontmatter.pop(name, None)
         for name, value in spec.get("set", {}).items():
             frontmatter[name] = value
+        # A canonical main item always declares reading_status explicitly
+        # (spec §6.1); the plugin Library filter keys on the field and
+        # Pydantic's default would mask a missing one. Legacy mapping
+        # values in the spec take precedence; otherwise default to unread
+        # exactly like items.py item creation. Inserted after the spec's
+        # `set` fields so its position matches a legacy-mapped note.
+        if "reading_status" not in frontmatter:
+            frontmatter["reading_status"] = "unread"
         for name, value in spec.get("add", {}).items():
             if value == PAPER_ID_PLACEHOLDER:
                 value = paper_id
@@ -355,6 +363,8 @@ def _transform_main_note(
             frontmatter.pop(name, None)
         frontmatter["citation_key"] = key
         frontmatter["paper_id"] = paper_id
+        if "reading_status" not in frontmatter:
+            frontmatter["reading_status"] = "unread"
     # A canonical main item always declares the schema explicitly (spec
     # §6); Pydantic's default would mask a missing field and the plugin
     # index rejects items without schema_version. Forcing it here is
@@ -503,6 +513,9 @@ def _generate_main_note(
     if isinstance(doi, str) and doi:
         frontmatter["doi"] = doi
     frontmatter["pdf_status"] = "available" if pdfs_available else "missing"
+    # Canonical items always declare reading_status (spec §6.1); default
+    # to unread like items.py item creation.
+    frontmatter["reading_status"] = "unread"
     Paper(**dict(frontmatter))  # raises ValidationError when non-canonical
     return _serialize_rt(frontmatter, "", "\n")
 
@@ -850,6 +863,20 @@ def _verify_item(
                         "code": "legacy_fields_remain",
                         "message": (
                             f"{key} still has legacy fields: {sorted(remnants)}"
+                        ),
+                        "path": str(main_note),
+                    }
+                )
+            # reading_status must be declared in the RAW frontmatter, not
+            # only present via Pydantic's default — the plugin Library
+            # filter keys on the field and an undeclared note matches no
+            # Reading status selection (spec §6.1).
+            if fm.get("reading_status") not in ("unread", "reading", "read"):
+                problems.append(
+                    {
+                        "code": "reading_status_missing",
+                        "message": (
+                            f"{key} lacks a valid reading_status in frontmatter"
                         ),
                         "path": str(main_note),
                     }

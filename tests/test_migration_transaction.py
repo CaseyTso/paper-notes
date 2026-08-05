@@ -247,6 +247,50 @@ class MigrationTransactionTest(unittest.TestCase):
             "unread",
         )
 
+    def test_reading_status_defaulted_when_no_legacy_status(self):
+        # A main note without a legacy 状态 field must still carry
+        # reading_status: unread in the RAW frontmatter (spec §6.1;
+        # the plugin index keys on the field). Asserting only
+        # paper.reading_status would pass via the Pydantic default even
+        # when the frontmatter omits the field.
+        self.apply()
+        for key in (HASH_KEY, AMBIGUOUS_KEY):
+            main = self.target_dir(key) / f"{key}.md"
+            self.assertEqual(
+                _frontmatter_dict(main)["reading_status"], "unread", key
+            )
+
+    def test_generated_main_note_has_reading_status(self):
+        # generate path (no standalone main note, R1) must also default
+        # reading_status: unread, like items.py item creation.
+        self.apply()
+        main = self.target_dir(R1_NO_MAIN_KEY) / f"{R1_NO_MAIN_KEY}.md"
+        self.assertEqual(
+            _frontmatter_dict(main)["reading_status"], "unread"
+        )
+
+    def test_verify_catches_missing_reading_status(self):
+        # Reverse injection: deleting reading_status from a migrated
+        # main note must make verify red. Pydantic's default would mask
+        # the missing field, so verify asserts on the raw frontmatter.
+        self.apply()
+        main = self.target_dir(HASH_KEY) / f"{HASH_KEY}.md"
+        text = main.read_text(encoding="utf-8")
+        self.assertIn("reading_status", text)  # sanity: field present post-fix
+        fm, body, newline = transaction._load_rt(text)
+        del fm["reading_status"]
+        main.write_text(
+            transaction._serialize_rt(fm, body, newline), encoding="utf-8"
+        )
+        report = self.verify()
+        self.assertEqual(report.status, "problems")
+        codes = {
+            problem["code"]
+            for item in report.items
+            for problem in item["problems"]
+        }
+        self.assertIn("reading_status_missing", codes)
+
     def test_main_note_body_preserved_byte_for_byte(self):
         self.apply()
         backup_main = self.backup_file(STANDARD, "Standard Single PDF 2024.md")
