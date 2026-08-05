@@ -78,6 +78,12 @@ DERIVED_PREFIXES = ("minerUmd_", "Figure解读_")
 
 _ZOTERO_MARKERS = ("zotero://", "zotero.org/users")
 
+# Bare Zotero item keys (8-char alphanumeric with at least one letter,
+# e.g. HU7IMCP2 / ABC12345) are active dependencies and must not survive
+# in any field value. A pure 8-digit token (e.g. a PMID) is not a Zotero
+# key and is left alone.
+_ZOTERO_BARE_KEY_RE = re.compile(r"^(?=.*[A-Z])[A-Z0-9]{8}$")
+
 _RT = YAML(typ="rt")
 _RT.width = 4096
 
@@ -325,6 +331,10 @@ def _transform_main_note(
 ) -> str:
     """Apply the dry-run transformation spec and validate as Paper."""
     frontmatter, body, newline = _load_rt(raw)
+    # Clean Zotero dependencies from the source values first; the spec
+    # below then (re)sets the canonical identity fields, which must never
+    # be mistaken for bare 8-char Zotero keys.
+    _scrub_zotero_values(frontmatter)
     if spec:
         for name in spec.get("remove", []):
             frontmatter.pop(name, None)
@@ -362,9 +372,52 @@ def _transform_derived_note(raw: str, *, key: str, paper_id: str) -> str:
         if _normalize_field(str(name)) in LEGACY_FIELDS
     ]:
         frontmatter.pop(name, None)
+    _scrub_zotero_values(frontmatter)
     frontmatter["citation_key"] = key
     frontmatter["paper_id"] = paper_id
     return _serialize_rt(frontmatter, body, newline)
+
+
+def _zotero_dependency(value: object) -> bool:
+    """True if a scalar string is an active Zotero dependency.
+
+    Matches ``zotero://`` / ``zotero.org/users`` URL markers and bare
+    8-char uppercase-alphanumeric item keys (e.g. ``HU7IMCP2``). Only
+    whole-string bare keys are treated as dependencies so prose that
+    merely contains such a token is preserved.
+    """
+    if not isinstance(value, str):
+        return False
+    if any(marker in value for marker in _ZOTERO_MARKERS):
+        return True
+    return _ZOTERO_BARE_KEY_RE.fullmatch(value) is not None
+
+
+def _scrub_zotero_values(frontmatter: dict[Any, Any]) -> None:
+    """Remove active Zotero dependencies from any field value in place.
+
+    Scalar values that are dependencies delete the field; list items
+    that are dependencies are dropped (the field is deleted when the
+    list becomes empty); nested mappings are scrubbed recursively.
+    Deleting only the legacy ``zotero`` / ``zotero link`` field names
+    is not enough — the dependency can hide in any field (e.g. a
+    multi-value ``source`` list next to a minerUmd wikilink).
+    """
+    for name in list(frontmatter):
+        value = frontmatter[name]
+        if isinstance(value, list):
+            kept = [item for item in value if not _zotero_dependency(item)]
+            if len(kept) != len(value):
+                if kept:
+                    frontmatter[name] = kept
+                else:
+                    del frontmatter[name]
+        elif isinstance(value, dict):
+            _scrub_zotero_values(value)
+            if not value:
+                del frontmatter[name]
+        elif _zotero_dependency(value):
+            del frontmatter[name]
 
 
 def _unique_attachment_name(used: set[str], name: str) -> str:
@@ -641,6 +694,31 @@ def _legacy_remnant_keys(frontmatter: dict[str, Any]) -> list[str]:
     return remnants
 
 
+def _zotero_remnant_values(frontmatter: dict[str, Any]) -> list[str]:
+    """Serialized values that still carry an active Zotero dependency.
+
+    Mirrors the apply scrub (``_zotero_dependency``) so verify never
+    reports ok while a ``zotero://`` / ``zotero.org/users`` marker or a
+    bare 8-char item key survives anywhere in the frontmatter, including
+    inside list items.
+    """
+    found: list[str] = []
+
+    def walk(value: object) -> None:
+        if isinstance(value, list):
+            for item in value:
+                walk(item)
+        elif isinstance(value, dict):
+            for item in value.values():
+                walk(item)
+        elif _zotero_dependency(value):
+            found.append(str(value))
+
+    for value in frontmatter.values():
+        walk(value)
+    return found
+
+
 def _verify_item(
     item: dict[str, Any],
     jitem: dict[str, Any],
@@ -747,12 +825,15 @@ def _verify_item(
                         "path": str(main_note),
                     }
                 )
-            blob = json.dumps(fm, ensure_ascii=False)
-            if any(marker in blob for marker in _ZOTERO_MARKERS):
+            zotero_remnants = _zotero_remnant_values(fm)
+            if zotero_remnants:
                 problems.append(
                     {
                         "code": "zotero_link_remains",
-                        "message": f"{key} still references Zotero in frontmatter",
+                        "message": (
+                            f"{key} still references Zotero in frontmatter: "
+                            f"{sorted(set(zotero_remnants))}"
+                        ),
                         "path": str(main_note),
                     }
                 )
@@ -922,6 +1003,18 @@ def _verify_item(
                     "message": (
                         f"derived note {target_file.name} still has legacy fields: "
                         f"{sorted(remnants)}"
+                    ),
+                    "path": str(target_file),
+                }
+            )
+        zotero_remnants = _zotero_remnant_values(dict(derived_fm))
+        if zotero_remnants:
+            problems.append(
+                {
+                    "code": "zotero_link_remains",
+                    "message": (
+                        f"derived note {target_file.name} still references "
+                        f"Zotero in frontmatter: {sorted(set(zotero_remnants))}"
                     ),
                     "path": str(target_file),
                 }

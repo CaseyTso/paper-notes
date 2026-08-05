@@ -90,8 +90,18 @@ def _frontmatter_dict(path: Path) -> dict:
     return dict(fm)
 
 
+def _frontmatter_dict_from_text(text: str) -> dict:
+    fm, _body, _nl = transaction._load_rt(text)
+    return dict(fm)
+
+
 def _body_of(path: Path) -> str:
     _fm, body, _nl = transaction._load_rt(path.read_text(encoding="utf-8"))
+    return body
+
+
+def _body_from_text(text: str) -> str:
+    _fm, body, _nl = transaction._load_rt(text)
     return body
 
 
@@ -263,6 +273,91 @@ class MigrationTransactionTest(unittest.TestCase):
         backup_fig = self.backup_file(XIA, f"Figure解读_{XIA_KEY}.md")
         self.assertTrue(target_fig.is_file())
         self.assertEqual(_body_of(target_fig), _body_of(backup_fig))
+
+    def test_derived_source_list_zotero_url_scrubbed_wikilink_kept(self):
+        # Figure解读 frontmatter carries a multi-value ``source``: a
+        # minerUmd wikilink and an active zotero:// URL (Task 32 R1
+        # repro: osborne/shiau notes). Apply must keep the wikilink and
+        # drop the Zotero dependency from the list.
+        self.apply()
+        target_fig = self.target_dir(XIA_KEY) / f"Figure解读_{XIA_KEY}.md"
+        self.assertTrue(target_fig.is_file())
+        fm = _frontmatter_dict(target_fig)
+        blob = json.dumps(fm, ensure_ascii=False)
+        self.assertNotIn("zotero://", blob)
+        self.assertNotIn("zotero.org", blob)
+        self.assertEqual(
+            fm["source"], ["[[minerUmd_xiaLargescaleSinglecellAnalysis2026]]"]
+        )
+        journal = transaction._load_journal(self.state, self.plan().run_id)
+        jitem = next(
+            j for j in journal["items"] if j["citation_key"] == XIA_KEY
+        )
+        self.assertEqual(fm["citation_key"], XIA_KEY)
+        self.assertEqual(fm["paper_id"], jitem["paper_id"])
+        # non-Zotero body prose survives byte-for-byte
+        self.assertIn("UMAP embedding", _body_of(target_fig))
+
+    def test_transform_derived_note_removes_bare_item_key(self):
+        # A bare Zotero item key (8-char uppercase alphanumeric) in a
+        # list is an active dependency and must be dropped.
+        raw = (
+            "---\n"
+            "citation key: someKey2024\n"
+            "source:\n"
+            "- '[[minerUmd_someKey2024]]'\n"
+            "- HU7IMCP2\n"
+            "---\n\n"
+            "Body prose.\n"
+        )
+        out = transaction._transform_derived_note(
+            raw, key="someKey2024", paper_id="550e8400-e29b-41d4-a716-446655440000"
+        )
+        fm = _frontmatter_dict_from_text(out)
+        self.assertEqual(
+            fm["source"], ["[[minerUmd_someKey2024]]"]
+        )
+        blob = json.dumps(fm, ensure_ascii=False)
+        self.assertNotIn("HU7IMCP2", blob)
+        self.assertIn("Body prose.", _body_from_text(out))
+
+    def test_verify_catches_zotero_marker_in_derived_fm(self):
+        self.apply()
+        fig = self.target_dir(XIA_KEY) / f"Figure解读_{XIA_KEY}.md"
+        fm, body, newline = transaction._load_rt(
+            fig.read_text(encoding="utf-8")
+        )
+        fm["source"] = ["zotero://select/library/items/INJ3CT"]
+        fig.write_text(
+            transaction._serialize_rt(fm, body, newline), encoding="utf-8"
+        )
+        report = self.verify()
+        self.assertEqual(report.status, "problems")
+        codes = {
+            problem["code"]
+            for item in report.items
+            for problem in item["problems"]
+        }
+        self.assertIn("zotero_link_remains", codes)
+
+    def test_verify_catches_zotero_marker_in_main_fm(self):
+        self.apply()
+        main = self.target_dir(SHIAU) / f"{SHIAU}.md"
+        fm, body, newline = transaction._load_rt(
+            main.read_text(encoding="utf-8")
+        )
+        fm["source"] = ["zotero://select/library/items/INJ3CT"]
+        main.write_text(
+            transaction._serialize_rt(fm, body, newline), encoding="utf-8"
+        )
+        report = self.verify()
+        self.assertEqual(report.status, "problems")
+        codes = {
+            problem["code"]
+            for item in report.items
+            for problem in item["problems"]
+        }
+        self.assertIn("zotero_link_remains", codes)
 
     def test_cards_preserved_byte_for_byte(self):
         self.apply()
