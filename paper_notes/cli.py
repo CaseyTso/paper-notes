@@ -300,6 +300,16 @@ def build_parser(json_mode: bool) -> _JsonAwareArgumentParser:
         "(default: ~/Library/Application Support/paper-notes/migrations)",
     )
     legacy_parser.add_argument(
+        "--zotero-db",
+        help="Zotero sqlite snapshot for identity/PDF candidates "
+        "(default: ~/Zotero/zotero.sqlite when --zotero-data-dir is given)",
+    )
+    legacy_parser.add_argument(
+        "--zotero-data-dir",
+        help="Zotero data directory for storage PDF resolution "
+        "(default: ~/Zotero)",
+    )
+    legacy_parser.add_argument(
         "--dry-run",
         action="store_true",
         help="build the plan and confirmation token without writing to the vault",
@@ -515,7 +525,22 @@ def _cmd_migrate_legacy_obsidian(args: argparse.Namespace) -> Envelope:
         except OSError as exc:
             raise UserError(f"cannot read keys file {args.keys_file}: {exc}") from exc
     vault = Path(args.vault)
-    plan = build_migration_plan(vault, keys=keys, state_root=state_root)
+    if args.zotero_db or args.zotero_data_dir:
+        # R1: consume a Zotero snapshot (read-only copy made by the
+        # adapter) for generated-main-note identity and storage PDFs.
+        from .adapters.zotero import ZoteroAdapter
+
+        db_path = args.zotero_db or (Path.home() / "Zotero" / "zotero.sqlite")
+        data_dir = args.zotero_data_dir or (Path.home() / "Zotero")
+        try:
+            with ZoteroAdapter(db_path=db_path, data_dir=data_dir) as ad:
+                plan = build_migration_plan(
+                    vault, keys=keys, state_root=state_root, zotero=ad
+                )
+        except OSError as exc:
+            raise UserError(f"cannot read Zotero snapshot: {exc}") from exc
+    else:
+        plan = build_migration_plan(vault, keys=keys, state_root=state_root)
     # Record the vault root so apply/verify/rollback can locate it later
     # without repeating --vault (additive; the token is unaffected).
     record_vault_root(plan.manifest_path, vault)

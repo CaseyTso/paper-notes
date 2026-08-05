@@ -48,7 +48,8 @@ def build_fixture(root: Path) -> Path:
             (10, 'ANN1', 4), (11, 'ATTACH6', 2), (12, 'ATTACH7', 2),
             (13, 'EMBED', 2), (14, '../../EVIL', 2);
         INSERT INTO fields (fieldID, fieldName) VALUES
-            (1, 'title'), (2, 'date'), (110, 'citationKey'), (35, 'url');
+            (1, 'title'), (2, 'date'), (110, 'citationKey'), (35, 'url'),
+            (36, 'DOI'), (37, 'publicationTitle');
         INSERT INTO itemDataValues (valueID, value) VALUES
             (1001, 'Congenital multiple eventrations of the right diaphragm'),
             (1002, '2014-05-01'),
@@ -57,9 +58,12 @@ def build_fixture(root: Path) -> Path:
             (1005, '2020'),
             (1006, 'A Note Body'),
             (1007, 'Parent Three Title'),
-            (1008, 'https://doi.org/10.1000/xyz');
+            (1008, 'https://doi.org/10.1000/xyz'),
+            (1009, '10.1000/congenital-diaphragm'),
+            (1010, 'Journal of Thoracic Disease');
         INSERT INTO itemData (itemID, fieldID, valueID) VALUES
             (1, 1, 1001), (1, 2, 1002), (1, 110, 1003),
+            (1, 36, 1009), (1, 37, 1010),
             (7, 1, 1004), (7, 2, 1005),
             (6, 1, 1006),
             (9, 1, 1007),
@@ -141,6 +145,55 @@ class ZoteroAdapterTest(unittest.TestCase):
             self.assertEqual(rec.citation_key, "wuCongenitalMultipleEventrations2014")
             rec2 = ad.resolve("PARENT2")
             self.assertIsNone(rec2.citation_key)
+        finally:
+            ad.close()
+
+    def test_record_exposes_doi_and_journal(self):
+        ad = self._adapter()
+        try:
+            rec = ad.resolve("PARENT1")
+            self.assertEqual(rec.doi, "10.1000/congenital-diaphragm")
+            self.assertEqual(rec.journal, "Journal of Thoracic Disease")
+        finally:
+            ad.close()
+
+    def test_resolve_by_citation_key(self):
+        ad = self._adapter()
+        try:
+            records = ad.resolve_by_citation_keys(
+                ["wuCongenitalMultipleEventrations2014"]
+            )
+            rec = records["wuCongenitalMultipleEventrations2014"]
+            self.assertIsNotNone(rec)
+            self.assertEqual(rec.source_key, "PARENT1")
+            self.assertEqual(rec.title, "Congenital multiple eventrations of the right diaphragm")
+            self.assertEqual(rec.year, "2014")
+            self.assertEqual(rec.creators, [{"family": "Wu", "given": "Xiao"}])
+            self.assertEqual(rec.doi, "10.1000/congenital-diaphragm")
+            pdfs = [a for a in rec.attachments if a.content_type == "application/pdf" and a.exists]
+            self.assertGreaterEqual(len(pdfs), 1)
+        finally:
+            ad.close()
+
+    def test_resolve_by_citation_keys_batch_with_missing(self):
+        ad = self._adapter()
+        try:
+            records = ad.resolve_by_citation_keys(
+                [
+                    "wuCongenitalMultipleEventrations2014",
+                    "GHOSTCITEKEY2026",
+                ]
+            )
+            self.assertIn("wuCongenitalMultipleEventrations2014", records)
+            self.assertIn("GHOSTCITEKEY2026", records)
+            self.assertIsNone(records["GHOSTCITEKEY2026"])
+        finally:
+            ad.close()
+
+    def test_resolve_by_citation_keys_empty(self):
+        ad = self._adapter()
+        try:
+            self.assertEqual(ad.resolve_by_citation_keys([]), {})
         finally:
             ad.close()
 

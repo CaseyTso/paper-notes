@@ -37,6 +37,8 @@ _FIELD_CITATION_KEY = "citationKey"
 _FIELD_TITLE = "title"
 _FIELD_DATE = "date"
 _FIELD_URL = "url"
+_FIELD_DOI = "DOI"
+_FIELD_PUBLICATION_TITLE = "publicationTitle"
 
 # Attachment link modes (Zotero itemAttachments.linkMode is an INTEGER).
 LINK_IMPORTED = "imported_file"
@@ -112,6 +114,8 @@ class ZoteroRecord:
     title: Optional[str]
     citation_key: Optional[str]
     year: Optional[str]
+    doi: Optional[str] = None
+    journal: Optional[str] = None
     creators: list[dict] = field(default_factory=list)
     attachments: list[Attachment] = field(default_factory=list)
 
@@ -277,6 +281,45 @@ class ZoteroAdapter:
         if parent_id is None:
             return None
         return self._bibliographic_record(parent_id)
+
+    def resolve_by_citation_keys(
+        self, keys: list[str] | tuple[str, ...]
+    ) -> dict[str, Optional[ZoteroRecord]]:
+        """Look up bibliographic records by BBT ``citationKey``.
+
+        Every requested key is present in the result; keys without a
+        matching bibliographic item map to ``None`` (the vault may carry
+        Figure-filename keys that are older than the current Zotero keys).
+        Only bibliographic item types are returned — a ``citationKey`` on a
+        note/attachment is never a record.
+        """
+        if self._closed:
+            raise RuntimeError("adapter is closed")
+        unique = list(dict.fromkeys(k for k in keys if k))
+        if not unique:
+            return {}
+        cur = self._require_conn().cursor()
+        placeholders = ",".join("?" * len(unique))
+        cur.execute(
+            f"""
+            SELECT i.itemID, i.itemTypeID, idv.value
+            FROM itemData id
+            JOIN items i ON id.itemID = i.itemID
+            JOIN fields f ON id.fieldID = f.fieldID
+            JOIN itemDataValues idv ON id.valueID = idv.valueID
+            WHERE f.fieldName = ? AND idv.value IN ({placeholders})
+            """,
+            (_FIELD_CITATION_KEY, *unique),
+        )
+        rows = cur.fetchall()
+        out: dict[str, Optional[ZoteroRecord]] = {key: None for key in unique}
+        for item_id, item_type_id, key in rows:
+            if key not in out or out[key] is not None:
+                continue
+            if not self._is_bibliographic(item_type_id):
+                continue
+            out[key] = self._bibliographic_record(item_id)
+        return out
 
     # -- internals -----------------------------------------------------
 
@@ -461,6 +504,8 @@ class ZoteroAdapter:
             title=self._field_value(item_id, _FIELD_TITLE),
             citation_key=self._field_value(item_id, _FIELD_CITATION_KEY),
             year=_year_of(date) if date else None,
+            doi=self._field_value(item_id, _FIELD_DOI),
+            journal=self._field_value(item_id, _FIELD_PUBLICATION_TITLE),
             creators=self._creators(item_id),
             attachments=self._attachments(item_id),
         )

@@ -378,14 +378,19 @@ def _unique_attachment_name(used: set[str], name: str) -> str:
     return candidate
 
 
+_SUPPL_MARKERS = ("nmf", "suppl", "supplementary")
+
+
 def _select_primary_pdf(
     pdfs: list[dict[str, Any]], key: str
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
     """Deterministic primary selection.
 
     Preference: a PDF whose stem equals the citation key, then a PDF
-    named exactly ``primary.pdf``, then the first recorded candidate.
-    The choice is recorded in the journal for verification.
+    named exactly ``primary.pdf``, then the first non-supplementary
+    candidate (R1: NMF/supplementary files never become the primary),
+    then the first recorded candidate. The choice is recorded in the
+    journal for verification.
     """
     if not pdfs:
         return None, []
@@ -396,8 +401,56 @@ def _select_primary_pdf(
     for pdf in ordered:
         if Path(pdf["path"]).name == "primary.pdf":
             return pdf, [p for p in ordered if p is not pdf]
+    non_suppl = [
+        pdf
+        for pdf in ordered
+        if not any(
+            marker in Path(pdf["path"]).name.lower() for marker in _SUPPL_MARKERS
+        )
+    ]
+    if non_suppl:
+        primary = non_suppl[0]
+        return primary, [p for p in ordered if p is not primary]
     primary, *rest = ordered
     return primary, list(rest)
+
+
+def _generate_main_note(
+    item: dict[str, Any], key: str, paper_id: str, *, pdfs_available: bool
+) -> str:
+    """Build the canonical main note for a folder without one (R1).
+
+    Identity comes from the dry-run plan's ``identity_fields`` (Zotero
+    record or Figure-filename key); the title falls back to the folder
+    name. Zotero source keys / zotero:// URLs never appear here.
+    """
+    fields = item.get("identity_fields") or {}
+    frontmatter = CommentedMap()
+    frontmatter["schema_version"] = 1
+    frontmatter["paper_id"] = paper_id
+    frontmatter["citation_key"] = key
+    title = fields.get("title") or item.get("title") or key
+    frontmatter["title"] = title
+    authors = fields.get("authors")
+    if isinstance(authors, list) and authors:
+        frontmatter["authors"] = list(authors)
+    journal = fields.get("journal")
+    if isinstance(journal, str) and journal:
+        frontmatter["journal"] = journal
+    year = fields.get("year")
+    if year is not None:
+        try:
+            year_int = int(year)
+        except (TypeError, ValueError):
+            year_int = None
+        if year_int is not None and 1000 <= year_int <= 9999:
+            frontmatter["year"] = year_int
+    doi = fields.get("DOI")
+    if isinstance(doi, str) and doi:
+        frontmatter["doi"] = doi
+    frontmatter["pdf_status"] = "available" if pdfs_available else "missing"
+    Paper(**dict(frontmatter))  # raises ValidationError when non-canonical
+    return _serialize_rt(frontmatter, "", "\n")
 
 
 def _backup_rel(source_dir: str, vault_rel: str) -> str:
@@ -427,39 +480,58 @@ def _build_staged_item(
     handled_backup: set[str] = set()
 
     main_rel = item["main_note"]
+    action = item.get("main_note_action")
+    pdfs = item.get("pdfs") or []
     if not main_rel:
-        raise MigrationError(f"item {item['source_dir']} has no main note")
-    main_source = vault / main_rel
-    spec = item["transformations"][0] if item["transformations"] else None
-    content = _transform_main_note(
-        _read_keep_newline(main_source),
-        key=key,
-        paper_id=paper_id,
-        spec=spec,
-    )
-    target_main = stage / f"{key}.md"
-    mode = stat.S_IMODE(main_source.stat().st_mode)
-    _atomic_write_text(target_main, content, mode=mode)
-    transformed.append(_backup_rel(source_dir, main_rel))
-    handled_backup.add(_backup_rel(source_dir, main_rel))
+        if action != "generate":
+            raise MigrationError(f"item {item['source_dir']} has no main note")
+        content = _generate_main_note(
+            item, key, paper_id, pdfs_available=bool(pdfs)
+        )
+        target_main = stage / f"{key}.md"
+        _atomic_write_text(target_main, content, mode=0o644)
+    else:
+        main_source = vault / main_rel
+        spec = item["transformations"][0] if item["transformations"] else None
+        content = _transform_main_note(
+            _read_keep_newline(main_source),
+            key=key,
+            paper_id=paper_id,
+            spec=spec,
+        )
+        target_main = stage / f"{key}.md"
+        mode = stat.S_IMODE(main_source.stat().st_mode)
+        _atomic_write_text(target_main, content, mode=mode)
+        transformed.append(_backup_rel(source_dir, main_rel))
+        handled_backup.add(_backup_rel(source_dir, main_rel))
 
     attachments_dir = stage / "attachments"
     used_attachment_names: set[str] = set()
 
-    pdfs = item.get("pdfs") or []
     primary, secondary = _select_primary_pdf(pdfs, key)
+    primary_record: str | None = None
     if primary is not None:
         shutil.copy2(vault / primary["path"], stage / f"{key}.pdf")
-        files[f"{key}.pdf"] = _backup_rel(source_dir, primary["path"])
-        handled_backup.add(_backup_rel(source_dir, primary["path"]))
+        if primary.get("source") == "zotero":
+            # External storage file: no backup exists; the journal keeps
+            # the absolute source path (verify compares the live file).
+            files[f"{key}.pdf"] = primary["path"]
+            primary_record = primary["path"]
+        else:
+            files[f"{key}.pdf"] = _backup_rel(source_dir, primary["path"])
+            handled_backup.add(_backup_rel(source_dir, primary["path"]))
+            primary_record = _backup_rel(source_dir, primary["path"])
     for pdf in secondary:
         name = _unique_attachment_name(
             used_attachment_names, Path(pdf["path"]).name
         )
         attachments_dir.mkdir(exist_ok=True)
         shutil.copy2(vault / pdf["path"], attachments_dir / name)
-        files[f"attachments/{name}"] = _backup_rel(source_dir, pdf["path"])
-        handled_backup.add(_backup_rel(source_dir, pdf["path"]))
+        if pdf.get("source") == "zotero":
+            files[f"attachments/{name}"] = pdf["path"]
+        else:
+            files[f"attachments/{name}"] = _backup_rel(source_dir, pdf["path"])
+            handled_backup.add(_backup_rel(source_dir, pdf["path"]))
 
     source_figures = source / "figures"
     if source_figures.is_dir():
@@ -528,10 +600,15 @@ def _build_staged_item(
     return {
         "files": files,
         "transformed": transformed,
-        "primary_pdf": (
-            _backup_rel(source_dir, primary["path"]) if primary is not None else None
-        ),
-        "secondary_pdfs": [_backup_rel(source_dir, p["path"]) for p in secondary],
+        "primary_pdf": primary_record,
+        "secondary_pdfs": [
+            # Zotero-storage PDFs are external: keep the absolute path so
+            # verify/rollback can still locate the source (no backup entry).
+            p["path"]
+            if p.get("source") == "zotero"
+            else _backup_rel(source_dir, p["path"])
+            for p in secondary
+        ],
     }
 
 
@@ -688,32 +765,35 @@ def _verify_item(
                 }
             )
 
-    # Body equality against the backup (frontmatter changes only).
-    main_backup = backup_root / Path(item["main_note"]).name
-    if main_backup.is_file():
-        try:
-            if _load_rt(_read_keep_newline(main_note))[1] != _load_rt(
-                _read_keep_newline(main_backup)
-            )[1]:
-                problems.append(
-                    {
-                        "code": "body_changed",
-                        "message": (
-                            f"main note body of {key} changed outside frontmatter"
-                        ),
-                        "path": str(main_note),
-                    }
-                )
-        except MigrationError:
-            pass
-    else:
-        problems.append(
-            {
-                "code": "backup_missing",
-                "message": f"backup main note missing for {key}",
-                "path": str(main_backup),
-            }
-        )
+    # Body equality against the backup (frontmatter changes only). For
+    # generated main notes (main_note_action == "generate", R1) there is
+    # no source backup to compare against — the note was created by apply.
+    if item.get("main_note"):
+        main_backup = backup_root / Path(item["main_note"]).name
+        if main_backup.is_file():
+            try:
+                if _load_rt(_read_keep_newline(main_note))[1] != _load_rt(
+                    _read_keep_newline(main_backup)
+                )[1]:
+                    problems.append(
+                        {
+                            "code": "body_changed",
+                            "message": (
+                                f"main note body of {key} changed outside frontmatter"
+                            ),
+                            "path": str(main_note),
+                        }
+                    )
+            except MigrationError:
+                pass
+        else:
+            problems.append(
+                {
+                    "code": "backup_missing",
+                    "message": f"backup main note missing for {key}",
+                    "path": str(main_backup),
+                }
+            )
 
     # Primary PDF.
     primary_backup_rel = jitem.get("primary_pdf")
@@ -773,8 +853,9 @@ def _verify_item(
             )
 
     # Derived notes: canonical names, identity fields, preserved bodies.
+    main_rel = item.get("main_note")
     for backup_rel in jitem.get("transformed", []):
-        if backup_rel == Path(item["main_note"]).name:
+        if main_rel is not None and backup_rel == Path(main_rel).name:
             continue
         backup_file = backup_root / backup_rel
         prefix = next(
@@ -942,7 +1023,7 @@ def _skip_reason(item: dict[str, Any]) -> str | None:
             ):
                 return requirement["reason"]
         return "no_target"
-    if item.get("main_note") is None:
+    if item.get("main_note") is None and item.get("main_note_action") != "generate":
         return "no_main_note"
     return None
 

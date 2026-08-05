@@ -28,6 +28,14 @@ from ..paths import is_valid_key, literature_root
 # Spec-named derived notes never act as main-note candidates.
 DERIVED_NOTE_PREFIXES = ("minerUmd_", "Figure解读_", "Figure_")
 
+# Filenames that embed a citation key in a derived note (R1: the key of a
+# folder without any standalone main note can be recovered from these).
+_DERIVED_KEY_RE = re.compile(r"^(?:Figure解读_|minerUmd_)(.+?)\.md$")
+
+# Frontmatter ``type`` values that mark a note as a card (R1): such notes
+# are cards even when their filename does not contain "card".
+_CARD_TYPES = frozenset({"cards", "card"})
+
 # Legacy frontmatter field names (normalized: lowercase, separators
 # removed; CJK characters are preserved by the normalization regex).
 LEGACY_KEY_FIELDS = frozenset({"citationkey"})
@@ -86,6 +94,38 @@ def _is_derived_note(name: str) -> bool:
     return name.startswith(DERIVED_NOTE_PREFIXES) or "card" in name.lower()
 
 
+def _frontmatter_type_is_card(frontmatter: dict[str, Any]) -> bool:
+    """``type: cards`` / ``type: card`` (case-insensitive) marks a card."""
+    value = frontmatter.get("type")
+    return isinstance(value, str) and value.strip().lower() in _CARD_TYPES
+
+
+def _is_card(path: Path) -> bool:
+    """A card note: frontmatter ``type`` or the legacy "card" filename
+    heuristic. Derived notes (``minerUmd_*`` / ``Figure解读_*``) are NOT
+    cards just because they are derived."""
+    if _frontmatter_type_is_card(_load_frontmatter(path)):
+        return True
+    return "card" in path.name.lower()
+
+
+def _is_derived_or_card(path: Path) -> bool:
+    """Derived by prefix filename rule OR by card semantics (R1)."""
+    if path.name.startswith(DERIVED_NOTE_PREFIXES):
+        return True
+    return _is_card(path)
+
+
+def _derived_key(name: str) -> str | None:
+    """Citation key embedded in a ``Figure解读_<key>.md`` / ``minerUmd_<key>.md``
+    filename; ``None`` when the stem is not a valid key."""
+    match = _DERIVED_KEY_RE.match(name)
+    if match is None:
+        return None
+    key = match.group(1)
+    return key if is_valid_key(key) else None
+
+
 def _pick_main_note(directory: Path, directory_name: str) -> tuple[Path | None, list[str]]:
     """Pick the main note of a legacy directory, if any.
 
@@ -93,14 +133,25 @@ def _pick_main_note(directory: Path, directory_name: str) -> tuple[Path | None, 
     notes nor cards. Notes carrying any legacy field win; otherwise the
     first candidate in sorted order is used. Ambiguity is reported as a
     diagnostic, never resolved destructively.
+
+    R1: a folder-titled note (``<folder>/<folder>.md``) is the
+    conventional main note and is exempt from the legacy "card in
+    filename" heuristic — a folder named "… Cards Type Paper" still has
+    a main note. Frontmatter ``type: cards`` and derived prefixes still
+    disqualify it.
     """
-    candidates = sorted(
-        path
-        for path in directory.iterdir()
-        if path.is_file()
-        and path.suffix.lower() == ".md"
-        and not _is_derived_note(path.name)
-    )
+    candidates: list[Path] = []
+    for path in sorted(directory.iterdir()):
+        if not (path.is_file() and path.suffix.lower() == ".md"):
+            continue
+        if path.stem == directory_name:
+            if path.name.startswith(DERIVED_NOTE_PREFIXES):
+                continue
+            if _frontmatter_type_is_card(_load_frontmatter(path)):
+                continue
+            candidates.append(path)
+        elif not _is_derived_or_card(path):
+            candidates.append(path)
     diagnostics: list[str] = []
     if not candidates:
         return None, ["no_main_note"]
@@ -151,6 +202,7 @@ class LegacyItem:
     title: str
     main_note: Path | None  # relative to the vault root (posix)
     declared_citation_key: str | None
+    figure_key: str | None  # key embedded in a Figure解读/minerUmd filename
     legacy_fields: tuple[str, ...]  # original legacy frontmatter key names
     zotero_fields: tuple[str, ...]  # original frontmatter keys found
     status_field: str | None
@@ -205,10 +257,27 @@ def _inventory_item(directory: Path, vault_root: Path) -> LegacyItem:
         if cards_dir.is_dir()
         else 0
     )
+    # Top-level cards: filename rule ("card" in name) OR frontmatter
+    # ``type: cards`` (R1) — including files whose name never says "card".
+    # Derived notes (minerUmd_*/Figure解读_*) are NOT cards.
+    card_count += sum(
+        1
+        for p in directory.iterdir()
+        if p.is_file()
+        and p.suffix.lower() == ".md"
+        and (p.name != main_note.name if main_note is not None else True)
+        and _is_card(p)
+    )
+    # Derived notes: prefix-derived notes AND cards (excluding the main
+    # note itself — a folder-titled note that happens to contain "card"
+    # in its name is still the main note, R1).
     derived_count = sum(
         1
         for p in directory.iterdir()
-        if p.is_file() and p.suffix.lower() == ".md" and _is_derived_note(p.name)
+        if p.is_file()
+        and p.suffix.lower() == ".md"
+        and (p.name != main_note.name if main_note is not None else True)
+        and _is_derived_or_card(p)
     )
     figures_dir = directory / "figures"
     figure_count = (
@@ -249,6 +318,20 @@ def _inventory_item(directory: Path, vault_root: Path) -> LegacyItem:
             ):
                 pdf_ref_missing = True
 
+    # R1: a folder without a standalone main note still yields a plan when
+    # a derived note filename (``Figure解读_<key>.md`` / ``minerUmd_<key>.md``)
+    # embeds a valid citation key; prefer Figure解读 (sorts first).
+    figure_key: str | None = None
+    for name in sorted(
+        p.name for p in directory.iterdir() if p.is_file() and p.suffix.lower() == ".md"
+    ):
+        key = _derived_key(name)
+        if key is not None:
+            figure_key = key
+            break
+    if declared_key is None and figure_key is not None:
+        declared_key = figure_key
+
     diagnostics: list[str] = list(note_diagnostics)
     if pdf_ref_missing:
         diagnostics.append("missing_pdf")
@@ -267,6 +350,7 @@ def _inventory_item(directory: Path, vault_root: Path) -> LegacyItem:
             else None
         ),
         declared_citation_key=declared_key,
+        figure_key=figure_key,
         legacy_fields=tuple(sorted(legacy_fields)),
         zotero_fields=tuple(sorted(zotero_fields)),
         status_field=status_field,

@@ -24,12 +24,14 @@ fixture-vault writes.
 import hashlib
 import json
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
+from paper_notes.adapters.zotero import ZoteroAdapter
 from paper_notes.migration import (
     RUN_ID_RE,
     build_migration_plan,
@@ -48,8 +50,28 @@ AMBIGUOUS = "Ambiguous Main PDF"
 CONFLICT = "Old Conflict Paper"
 NO_KEY = "No Key Paper"
 UNICODE = "Unicode 论文, 带 标点 & Ünïcode 2026"
+R1_NO_MAIN = "R1 No Main Note"
+R1_CARDS_TYPE = "R1 Cards Type Paper"
+R1_ZOTERO_PDF = "R1 Zotero PDF Paper"
 
-ALL_LEGACY = (STANDARD, DERMATO, XIA, HASH_FIG, MISSING, AMBIGUOUS, CONFLICT, NO_KEY, UNICODE)
+ALL_LEGACY = (
+    STANDARD,
+    DERMATO,
+    XIA,
+    HASH_FIG,
+    MISSING,
+    AMBIGUOUS,
+    CONFLICT,
+    NO_KEY,
+    UNICODE,
+    R1_NO_MAIN,
+    R1_CARDS_TYPE,
+    R1_ZOTERO_PDF,
+)
+
+R1_NO_MAIN_KEY = "r1NoMainNote2026"
+R1_CARDS_KEY = "r1CardsType2026"
+R1_ZOTERO_KEY = "r1ZoteroPdf2026"
 
 
 def _pdf_sha256(rel: str) -> str:
@@ -235,9 +257,9 @@ class DiscoveryTest(unittest.TestCase):
 
     def test_inventory_diagnostics(self):
         inv = self.plan["diagnostics"]["inventory"]
-        self.assertEqual(inv["items"], 9)
-        self.assertEqual(inv["pdfs"], 10)
-        self.assertEqual(inv["cards"], 4)
+        self.assertEqual(inv["items"], 12)
+        self.assertEqual(inv["pdfs"], 11)
+        self.assertEqual(inv["cards"], 6)
         self.assertGreater(inv["total_bytes"], 0)
 
     def test_zero_fixture_vault_writes(self):
@@ -256,7 +278,7 @@ class DiscoveryTest(unittest.TestCase):
             data = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(data["run_id"], plan.run_id)
             self.assertEqual(data["confirmation_token"], plan.confirmation_token)
-            self.assertEqual(len(data["items"]), 9)
+            self.assertEqual(len(data["items"]), 12)
             self.assertNotIn(
                 "05 Literature",
                 str(manifest_path.relative_to(state_root)),
@@ -310,6 +332,220 @@ class DiscoveryTest(unittest.TestCase):
             self.assertIn("dupKey2026", plan.duplicate_targets)
 
 
+def build_r1_zotero_fixture(root: Path) -> Path:
+    """Zotero snapshot fixture for the R1 integration tests (never committed).
+
+    Mirrors the real schema: INTEGER linkMode, ``storage/<attachmentKey>/``
+    layout, creator fieldMode 0/1, DOI/publicationTitle fields, and BBT
+    ``citationKey`` values equal to the R1 vault fixture keys.
+    """
+    db = root / "zotero.sqlite"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE itemTypes (itemTypeID INTEGER PRIMARY KEY, typeName TEXT);
+        CREATE TABLE items (itemID INTEGER PRIMARY KEY, key TEXT, itemTypeID INTEGER);
+        CREATE TABLE fields (fieldID INTEGER PRIMARY KEY, fieldName TEXT);
+        CREATE TABLE itemData (itemID INTEGER, fieldID INTEGER, valueID INTEGER);
+        CREATE TABLE itemDataValues (valueID INTEGER PRIMARY KEY, value TEXT);
+        CREATE TABLE itemAttachments (itemID INTEGER PRIMARY KEY,
+            parentItemID INTEGER, linkMode INTEGER, path TEXT, contentType TEXT);
+        CREATE TABLE creators (creatorID INTEGER PRIMARY KEY, firstName TEXT, lastName TEXT, fieldMode INTEGER);
+        CREATE TABLE creatorTypes (creatorTypeID INTEGER PRIMARY KEY, creatorType TEXT);
+        CREATE TABLE itemCreators (itemID INTEGER, creatorID INTEGER, creatorTypeID INTEGER, orderIndex INTEGER);
+
+        INSERT INTO itemTypes (itemTypeID, typeName) VALUES
+            (1, 'journalArticle'), (2, 'attachment'), (3, 'note'), (4, 'annotation');
+        INSERT INTO items (itemID, key, itemTypeID) VALUES
+            (1, 'R1PAR1', 1), (2, 'R1ATT1', 2), (3, 'R1PAR2', 1),
+            (4, 'R1ATT2', 2), (5, 'R1ATT3', 2);
+        INSERT INTO fields (fieldID, fieldName) VALUES
+            (1, 'title'), (2, 'date'), (110, 'citationKey'), (36, 'DOI'), (37, 'publicationTitle');
+        INSERT INTO itemDataValues (valueID, value) VALUES
+            (1001, 'R1 No Main Note Zotero Title'),
+            (1002, '2026-03-01'),
+            (1003, 'r1NoMainNote2026'),
+            (1004, '10.1000/r1nomain'),
+            (1005, 'Nature Methods'),
+            (1006, 'R1 Zotero PDF Zotero Title'),
+            (1007, '2026-05-15'),
+            (1008, 'r1ZoteroPdf2026'),
+            (1009, '10.1000/r1zotero'),
+            (1010, 'Cell');
+        INSERT INTO itemData (itemID, fieldID, valueID) VALUES
+            (1, 1, 1001), (1, 2, 1002), (1, 110, 1003), (1, 36, 1004), (1, 37, 1005),
+            (3, 1, 1006), (3, 2, 1007), (3, 110, 1008), (3, 36, 1009), (3, 37, 1010);
+        INSERT INTO itemAttachments (itemID, parentItemID, linkMode, path, contentType) VALUES
+            (2, 1, 0, 'storage:r1nomain-main.pdf', 'application/pdf'),
+            (4, 3, 0, 'storage:r1zotero-main.pdf', 'application/pdf'),
+            (5, 3, 0, 'storage:NMF.pdf', 'application/pdf');
+        INSERT INTO creators (creatorID, firstName, lastName, fieldMode) VALUES
+            (1, 'First', 'R1Author', 0), (2, 'Min', 'Zhao', 0);
+        INSERT INTO creatorTypes (creatorTypeID, creatorType) VALUES (1, 'author');
+        INSERT INTO itemCreators (itemID, creatorID, creatorTypeID, orderIndex) VALUES
+            (1, 1, 1, 0), (3, 2, 1, 0);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    storage = root / "storage"
+    (storage / "R1ATT1").mkdir(parents=True)
+    (storage / "R1ATT1" / "r1nomain-main.pdf").write_bytes(
+        b"%PDF-1.4 r1 no-main-note pdf fixture.%%EOF"
+    )
+    (storage / "R1ATT2").mkdir()
+    (storage / "R1ATT2" / "r1zotero-main.pdf").write_bytes(
+        b"%PDF-1.4 r1 zotero main text fixture.%%EOF"
+    )
+    (storage / "R1ATT3").mkdir()
+    (storage / "R1ATT3" / "NMF.pdf").write_bytes(
+        b"%PDF-1.4 r1 zotero NMF supplementary fixture.%%EOF"
+    )
+    return db
+
+
+class R1DiscoveryTest(unittest.TestCase):
+    """R1 semantics (plan 2026-08-05): generate main note, type:cards, and
+    keys filtering by Figure-filename key."""
+
+    @classmethod
+    def setUpClass(cls):
+        with tempfile.TemporaryDirectory() as state:
+            cls.plan = build_migration_plan(
+                FIXTURE, state_root=Path(state)
+            ).to_json()
+
+    def test_no_main_note_yields_generate_plan(self):
+        item = _item(self.plan, R1_NO_MAIN)
+        self.assertIsNone(item["main_note"])
+        self.assertEqual(item["main_note_action"], "generate")
+        self.assertEqual(item["citation_key"], R1_NO_MAIN_KEY)
+        self.assertEqual(item["identity_source"], "figure_filename")
+        self.assertEqual(item["identity_fields"], {"citation_key": R1_NO_MAIN_KEY})
+        self.assertIn("main_note_generate", item["diagnostics"])
+        self.assertEqual(item["derived_count"], 3)  # Figure + minerUmd + cards
+        self.assertEqual(item["card_count"], 1)
+        self.assertIsNotNone(item["target"])
+        self.assertEqual(item["target"]["citation_key"], R1_NO_MAIN_KEY)
+        reasons = [c["reason"] for c in item["confirmation_required"]]
+        self.assertNotIn("missing_citation_key", reasons)
+        self.assertIn("missing_pdf", reasons)
+
+    def test_type_cards_frontmatter_not_main_candidate(self):
+        item = _item(self.plan, R1_CARDS_TYPE)
+        self.assertEqual(
+            item["main_note"],
+            f"05 Literature/{R1_CARDS_TYPE}/R1 Cards Type Paper.md",
+        )
+        self.assertEqual(item["main_note_action"], "transform")
+        self.assertEqual(item["card_count"], 1)
+        self.assertEqual(item["citation_key"], R1_CARDS_KEY)
+
+    def test_no_main_note_folder_never_uses_cards_as_main(self):
+        item = _item(self.plan, R1_NO_MAIN)
+        self.assertIsNone(item["main_note"])
+        self.assertNotIn("key-points.md", str(item["main_note"]))
+
+    def test_keys_filter_matches_figure_filename_key(self):
+        # No frontmatter citation key; only the Figure解读 filename carries
+        # r1NoMainNote2026. --keys must still select the item.
+        with tempfile.TemporaryDirectory() as state:
+            plan = build_migration_plan(
+                FIXTURE,
+                keys=[R1_NO_MAIN_KEY],
+                state_root=Path(state),
+            ).to_json()
+            self.assertEqual(len(plan["items"]), 1)
+            self.assertEqual(plan["items"][0]["citation_key"], R1_NO_MAIN_KEY)
+            self.assertIn("R1 No Main Note", plan["items"][0]["source_dir"])
+
+
+class R1ZoteroIntegrationTest(unittest.TestCase):
+    """Dry-run consuming the Zotero storage snapshot (R1)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.zroot = self.tmp / "zotero"
+        self.zroot.mkdir()
+        self.zdb = build_r1_zotero_fixture(self.zroot)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _plan(self, keys=None):
+        with tempfile.TemporaryDirectory() as state:
+            with ZoteroAdapter(db_path=self.zdb, data_dir=self.zroot) as ad:
+                return build_migration_plan(
+                    FIXTURE, keys=keys, state_root=Path(state), zotero=ad
+                ).to_json()
+
+    def test_generate_item_identity_from_zotero(self):
+        plan = self._plan()
+        item = _item(plan, R1_NO_MAIN)
+        self.assertEqual(item["main_note_action"], "generate")
+        self.assertEqual(item["identity_source"], "zotero_item")
+        fields = item["identity_fields"]
+        self.assertEqual(fields["citation_key"], R1_NO_MAIN_KEY)
+        self.assertEqual(fields["title"], "R1 No Main Note Zotero Title")
+        self.assertEqual(fields["journal"], "Nature Methods")
+        self.assertEqual(fields["year"], "2026")
+        self.assertEqual(fields["DOI"], "10.1000/r1nomain")
+        self.assertEqual(
+            fields["authors"], [{"family": "R1Author", "given": "First"}]
+        )
+        # Zotero source keys / zotero:// URLs must never be planned into the
+        # generated frontmatter.
+        blob = json.dumps(fields, ensure_ascii=False)
+        self.assertNotIn("R1PAR1", blob)
+        self.assertNotIn("zotero://", blob)
+        self.assertNotIn("zotero.org", blob)
+
+    def test_zero_vault_pdf_with_zotero_candidates(self):
+        plan = self._plan()
+        item = _item(plan, R1_ZOTERO_PDF)
+        self.assertEqual(item["pdf_count"], 2)
+        self.assertEqual({p["source"] for p in item["pdfs"]}, {"zotero"})
+        reasons = [c["reason"] for c in item["confirmation_required"]]
+        self.assertIn("multiple_pdfs", reasons)
+        self.assertNotIn("missing_pdf", reasons)
+        names = sorted(Path(p["path"]).name for p in item["pdfs"])
+        self.assertEqual(names, ["NMF.pdf", "r1zotero-main.pdf"])
+        for pdf in item["pdfs"]:
+            self.assertTrue(Path(pdf["path"]).is_absolute())
+            self.assertTrue(pdf["sha256"])
+            self.assertGreater(pdf["bytes"], 0)
+        main_pdf = next(
+            p for p in item["pdfs"] if Path(p["path"]).name == "r1zotero-main.pdf"
+        )
+        self.assertEqual(
+            main_pdf["sha256"],
+            hashlib.sha256(
+                (
+                    self.zroot / "storage" / "R1ATT2" / "r1zotero-main.pdf"
+                ).read_bytes()
+            ).hexdigest(),
+        )
+        # recommended primary = main text; NMF.pdf stays a candidate
+        req = next(
+            c
+            for c in item["confirmation_required"]
+            if c["reason"] == "multiple_pdfs"
+        )
+        self.assertEqual(Path(req["recommended_primary"]).name, "r1zotero-main.pdf")
+        self.assertIn(
+            "NMF.pdf", [Path(c).name for c in req["candidates"]]
+        )
+
+    def test_transform_item_keeps_existing_main_note(self):
+        plan = self._plan()
+        item = _item(plan, R1_ZOTERO_PDF)
+        self.assertEqual(item["main_note_action"], "transform")
+        self.assertEqual(item["main_note"], f"05 Literature/{R1_ZOTERO_PDF}/R1 Zotero PDF Paper.md")
+        self.assertIsNone(item.get("identity_fields"))
+
+
 class CliMigrationTest(unittest.TestCase):
     def _run(self, *args):
         return subprocess.run(
@@ -332,7 +568,7 @@ class CliMigrationTest(unittest.TestCase):
             self.assertRegex(data["run_id"], RUN_ID_RE)
             self.assertIn("confirmation_token", data)
             self.assertEqual(data["writes"]["vault_writes"], 0)
-            self.assertEqual(len(data["items"]), 9)
+            self.assertEqual(len(data["items"]), 12)
             self.assertTrue(Path(data["manifest_path"]).is_file())
 
     def test_cli_keys_filter(self):
@@ -371,6 +607,36 @@ class CliMigrationTest(unittest.TestCase):
             payload = json.loads(result.stdout)
             self.assertEqual(payload["status"], "error")
             self.assertEqual(payload["errors"][0]["code"], "user_error")
+
+    def test_cli_dry_run_consumes_zotero_snapshot(self):
+        # R1: --zotero-db/--zotero-data-dir feed the plan builder; the
+        # Zotero-storage PDFs appear as primary-PDF candidates.
+        with tempfile.TemporaryDirectory() as state:
+            zroot = Path(state) / "zotero"
+            zroot.mkdir()
+            zdb = build_r1_zotero_fixture(zroot)
+            result = self._run(
+                "--dry-run",
+                "--vault",
+                str(FIXTURE),
+                "--zotero-db",
+                str(zdb),
+                "--zotero-data-dir",
+                str(zroot),
+                "--state-root",
+                str(Path(state) / "state"),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            items = {
+                i["source_dir"].split("/")[-1]: i for i in payload["data"]["items"]
+            }
+            item = items[R1_ZOTERO_PDF]
+            self.assertEqual(item["pdf_count"], 2)
+            self.assertEqual({p["source"] for p in item["pdfs"]}, {"zotero"})
+            reasons = [c["reason"] for c in item["confirmation_required"]]
+            self.assertIn("multiple_pdfs", reasons)
+            self.assertNotIn("missing_pdf", reasons)
 
     def test_cli_zero_fixture_vault_writes(self):
         before = _tree_manifest(FIXTURE)
