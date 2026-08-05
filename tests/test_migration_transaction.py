@@ -52,6 +52,7 @@ NO_KEY = "No Key Paper"
 MISSING = "Missing PDF Paper"
 R1_NO_MAIN = "R1 No Main Note"
 R1_ZOTERO_PDF = "R1 Zotero PDF Paper"
+R1_CARDS = "R1 Cards Type Paper"
 
 SHIAU = "shiauSpatiallyResolvedAnalysis2024"
 OSBORNE = "osborneDermatomyositisCharacterizedJAK1mediated2025"
@@ -364,6 +365,94 @@ class MigrationTransactionTest(unittest.TestCase):
         target_card = self.target_dir(OSBORNE) / "cards" / "card-1.md"
         backup_card = self.backup_file(DERMATO, "cards/card-1.md")
         self.assertEqual(target_card.read_bytes(), backup_card.read_bytes())
+
+    def test_top_level_cards_routed_to_cards_not_attachments(self):
+        # R3: a top-level `type: cards` note (no cards/ subdir, no
+        # derived prefix) must land in cards/, never attachments/ — the
+        # plugin's Open cards only resolves <dir>/cards/.
+        self.apply()
+        for key, source in ((R1_CARDS_KEY, R1_CARDS), (R1_NO_MAIN_KEY, R1_NO_MAIN)):
+            target = self.target_dir(key)
+            card = target / "cards" / "key-points.md"
+            self.assertTrue(card.is_file(), f"card missing for {key}")
+            self.assertFalse(
+                (target / "attachments" / "key-points.md").exists(),
+                f"card wrongly in attachments/ for {key}",
+            )
+            # journal mapping agrees: transformed (not a byte-copied file)
+            journal = transaction._load_journal(self.state, self.plan().run_id)
+            jitem = next(j for j in journal["items"] if j["citation_key"] == key)
+            self.assertIn("key-points.md", jitem["transformed"])
+            self.assertNotIn(
+                "attachments/key-points.md", jitem["files"]
+            )
+
+    def test_top_level_card_gets_identity_fields(self):
+        # R3: routed cards keep their content and gain the minimal
+        # relationship fields (design spec §6.2), like derived notes.
+        self.apply()
+        card = self.target_dir(R1_CARDS_KEY) / "cards" / "key-points.md"
+        fm = _frontmatter_dict(card)
+        self.assertEqual(fm["citation_key"], R1_CARDS_KEY)
+        journal = transaction._load_journal(self.state, self.plan().run_id)
+        jitem = next(j for j in journal["items"] if j["citation_key"] == R1_CARDS_KEY)
+        self.assertEqual(fm["paper_id"], jitem["paper_id"])
+        backup_card = self.backup_file(R1_CARDS, "key-points.md")
+        self.assertEqual(_body_of(card), _body_of(backup_card))
+
+    def test_verify_catches_card_routed_to_attachments(self):
+        # R3 reverse: verify must flag a top-level card that was routed
+        # to attachments/ (the original bug), even when bytes are intact.
+        self.apply()
+        target = self.target_dir(R1_CARDS_KEY)
+        card = target / "cards" / "key-points.md"
+        self.assertTrue(card.is_file())
+        (target / "attachments").mkdir(exist_ok=True)
+        card.rename(target / "attachments" / "key-points.md")
+        report = self.verify()
+        self.assertEqual(report.status, "problems")
+        codes = {
+            problem["code"]
+            for item in report.items
+            for problem in item["problems"]
+        }
+        self.assertIn("card_in_attachments", codes)
+
+    def test_fabp4_style_top_level_card_routed_to_cards(self):
+        # Task 34 FABP4 shape: a top-level `type: cards` card whose
+        # filename never says "card" must still be classified and routed
+        # to cards/ by apply.
+        item = self.vault / "05 Literature" / "FABP4 paper 2026"
+        item.mkdir()
+        (item / "FABP4 paper 2026.md").write_text(
+            "---\ntitle: FABP4 paper\ncitation key: fabp4Adipocyte2026\n"
+            "---\n\nBody.\n",
+            encoding="utf-8",
+        )
+        (item / "不同分组比较细胞通讯强度来找关键细胞互作.md").write_text(
+            "---\ntype: cards\n---\n\n# 通讯\n\n内容。\n",
+            encoding="utf-8",
+        )
+        plan = build_migration_plan(self.vault, state_root=self.state)
+        item_json = next(
+            i for i in plan.items if "FABP4" in i["source_dir"]
+        )
+        self.assertEqual(item_json["card_count"], 1)
+        transaction.apply_migration(
+            plan.run_id,
+            plan.confirmation_token,
+            vault_root=self.vault,
+            state_root=self.state,
+        )
+        target = self.target_dir("fabp4Adipocyte2026")
+        card = target / "cards" / "不同分组比较细胞通讯强度来找关键细胞互作.md"
+        self.assertTrue(card.is_file(), f"FABP4 card missing: {card}")
+        self.assertFalse(
+            (target / "attachments" / "不同分组比较细胞通讯强度来找关键细胞互作.md").exists(),
+        )
+        self.assertEqual(transaction.verify_migration(
+            plan.run_id, vault_root=self.vault, state_root=self.state
+        ).status, "ok")
 
     def test_primary_pdf_hash_matches(self):
         self.apply()

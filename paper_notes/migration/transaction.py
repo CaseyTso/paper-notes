@@ -60,6 +60,7 @@ from .legacy import (
     LEGACY_PDF_REF_FIELDS,
     LEGACY_STATUS_FIELDS,
     LEGACY_ZOTERO_FIELDS,
+    _is_card,
     _normalize_field,
 )
 from .manifest import PAPER_ID_PLACEHOLDER, RUN_ID_RE, default_state_root
@@ -634,6 +635,10 @@ def _build_staged_item(
         transformed.append(backup_rel)
         handled_backup.add(backup_rel)
 
+    # Top-level cards (R3): a `type: cards` note (or "card" filename) at
+    # the item root — with no cards/ subdirectory and no derived prefix —
+    # is a card and belongs in cards/, transformed like a derived note
+    # (design spec §6.2: cards retain content + minimal relation fields).
     # Everything else lands in attachments/ with its original bytes.
     for path in sorted(source.rglob("*")):
         if not path.is_file():
@@ -643,6 +648,30 @@ def _build_staged_item(
             continue
         if backup_rel.startswith(("figures/", "cards/")):
             continue  # already copied wholesale above
+        if (
+            path.parent == source
+            and path.suffix.lower() == ".md"
+            and _is_card(path)
+        ):
+            target_card = stage / "cards" / path.name
+            if target_card.exists():
+                # A cards/ member already owns this name: preserve bytes
+                # in attachments/ (mirror the duplicate derived-note path).
+                name = _unique_attachment_name(used_attachment_names, backup_rel)
+                attachments_dir.mkdir(exist_ok=True)
+                shutil.copy2(path, attachments_dir / name)
+                files[f"attachments/{name}"] = backup_rel
+                handled_backup.add(backup_rel)
+                continue
+            content = _transform_derived_note(
+                _read_keep_newline(path), key=key, paper_id=paper_id
+            )
+            mode = stat.S_IMODE(path.stat().st_mode)
+            target_card.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_text(target_card, content, mode=mode)
+            transformed.append(backup_rel)
+            handled_backup.add(backup_rel)
+            continue
         name = _unique_attachment_name(used_attachment_names, backup_rel)
         target_file = attachments_dir / name
         target_file.parent.mkdir(parents=True, exist_ok=True)
@@ -934,6 +963,8 @@ def _verify_item(
             )
 
     # Derived notes: canonical names, identity fields, preserved bodies.
+    # Top-level cards (R3) are verified the same way; their canonical
+    # position is cards/, never attachments/.
     main_rel = item.get("main_note")
     for backup_rel in jitem.get("transformed", []):
         if main_rel is not None and backup_rel == Path(main_rel).name:
@@ -947,9 +978,27 @@ def _verify_item(
             ),
             None,
         )
-        if prefix is None:
+        if prefix is not None:
+            target_file = target / f"{prefix}{key}.md"
+        elif backup_file.is_file() and _is_card(backup_file):
+            # Top-level card: canonical position is cards/<name>; a card
+            # that ended up in attachments/ breaks the plugin's Open
+            # cards (which only resolves <dir>/cards/).
+            card_name = Path(backup_rel).name
+            if (target / "attachments" / card_name).is_file():
+                problems.append(
+                    {
+                        "code": "card_in_attachments",
+                        "message": (
+                            f"top-level card {card_name} was routed to "
+                            "attachments/ instead of cards/"
+                        ),
+                        "path": str(target / "attachments" / card_name),
+                    }
+                )
+            target_file = target / "cards" / card_name
+        else:
             continue
-        target_file = target / f"{prefix}{key}.md"
         if not target_file.is_file():
             problems.append(
                 {
