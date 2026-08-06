@@ -343,6 +343,26 @@ class MigrationTransactionTest(unittest.TestCase):
         # non-Zotero body prose survives byte-for-byte
         self.assertIn("UMAP embedding", _body_of(target_fig))
 
+    def test_transform_derived_note_without_frontmatter(self):
+        # A MinerU-converted note may be a bare transcript with no YAML
+        # header (e.g. "RESEARCH ARTICLE SUMMARY"). Migration must not
+        # fail the batch: the whole text becomes the preserved body and
+        # canonical identity fields are added in a fresh frontmatter.
+        raw = "RESEARCH ARTICLE SUMMARY\n\nIMMUNOLOGY\n\n# Title\n\nBody prose.\n"
+        out = transaction._transform_derived_note(
+            raw,
+            key="suoMappingDevelopingHuman2022",
+            paper_id="550e8400-e29b-41d4-a716-446655440000",
+        )
+        fm = _frontmatter_dict_from_text(out)
+        self.assertEqual(fm["citation_key"], "suoMappingDevelopingHuman2022")
+        self.assertEqual(
+            fm["paper_id"], "550e8400-e29b-41d4-a716-446655440000"
+        )
+        body = _body_from_text(out)
+        self.assertTrue(body.startswith("RESEARCH ARTICLE SUMMARY"))
+        self.assertIn("Body prose.", body)
+
     def test_transform_derived_note_removes_bare_item_key(self):
         # A bare Zotero item key (8-char uppercase alphanumeric) in a
         # list is an active dependency and must be dropped.

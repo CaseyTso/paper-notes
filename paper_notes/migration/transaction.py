@@ -168,6 +168,32 @@ def _load_rt(raw: str) -> tuple[CommentedMap, str, str]:
     return data, body, newline
 
 
+def _load_rt_lenient(raw: str) -> tuple[CommentedMap, str, str]:
+    """Like :func:`_load_rt`, but tolerate a missing (or unterminated)
+    frontmatter block.
+
+    MinerU transcripts sometimes carry no YAML header (e.g. a bare
+    ``RESEARCH ARTICLE SUMMARY`` lead); discovery's loose parse treats
+    them as plain notes while the strict round-trip codec would abort
+    the whole batch. In that case the entire text becomes the body and
+    the transformation writes a fresh frontmatter. A *present* block
+    still goes through the strict codec unchanged.
+    """
+    newline = "\r\n" if "\r\n" in raw else "\n"
+    text = raw.replace("\r\n", "\n") if newline == "\r\n" else raw
+    lines = text.split("\n")
+    if not lines or lines[0] != "---":
+        return CommentedMap(), text, newline
+    end = None
+    for i in range(1, len(lines)):
+        if lines[i] == "---":
+            end = i
+            break
+    if end is None:
+        return CommentedMap(), text, newline
+    return _load_rt(raw)
+
+
 def _serialize_rt(frontmatter: CommentedMap, body: str, newline: str) -> str:
     buf = io.StringIO()
     _RT.dump(frontmatter, buf)
@@ -376,7 +402,7 @@ def _transform_main_note(
 
 def _transform_derived_note(raw: str, *, key: str, paper_id: str) -> str:
     """Remove legacy fields and set identity fields on a derived note."""
-    frontmatter, body, newline = _load_rt(raw)
+    frontmatter, body, newline = _load_rt_lenient(raw)
     for name in [
         name
         for name in frontmatter
@@ -1037,9 +1063,9 @@ def _verify_item(
                 }
             )
             continue
-        if backup_file.is_file() and _load_rt(
+        if backup_file.is_file() and _load_rt_lenient(
             _read_keep_newline(target_file)
-        )[1] != _load_rt(_read_keep_newline(backup_file))[1]:
+        )[1] != _load_rt_lenient(_read_keep_newline(backup_file))[1]:
             problems.append(
                 {
                     "code": "body_changed",
