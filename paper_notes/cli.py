@@ -14,7 +14,7 @@ import traceback
 from pathlib import Path
 from typing import Any, NoReturn
 
-from . import __version__, attachments, citations, config, csl, deletion, items
+from . import __version__, attachments, cards, citations, config, csl, deletion, items
 from .identifiers import extract_identifiers, parse_arxiv, parse_doi, parse_pmcid, parse_pmid
 from .protocol import (
     EXIT_CONFLICT,
@@ -355,6 +355,49 @@ def build_parser(json_mode: bool) -> _JsonAwareArgumentParser:
         "(default: ~/Library/Application Support/paper-notes/migrations)",
     )
     rollback_parser.set_defaults(func=_cmd_migrate_rollback)
+
+    card_parser = subparsers.add_parser(
+        "card",
+        help="create derived card notes under a paper's cards/ directory",
+        json_mode=json_mode,
+    )
+    card_parser.set_defaults(func=_cmd_card_root)
+    card_subparsers = card_parser.add_subparsers(dest="card_command")
+
+    card_create_parser = card_subparsers.add_parser(
+        "create",
+        help="create a derived card note (minimal relation frontmatter)",
+        json_mode=json_mode,
+    )
+    card_create_parser.add_argument("--vault", required=True, help="vault root directory")
+    card_create_parser.add_argument("--key", required=True, help="citation key or alias")
+    card_create_parser.add_argument(
+        "--title", required=True, help="conclusive one-line card title"
+    )
+    card_create_parser.add_argument(
+        "--selection-file",
+        required=True,
+        help="file containing the verbatim selected Markdown content",
+    )
+    card_create_parser.add_argument(
+        "--filename",
+        help="explicit card filename (default: card_<slug>.md derived from title)",
+    )
+    card_create_parser.add_argument(
+        "--anchor-name", help="block anchor name to insert into the source note"
+    )
+    card_create_parser.add_argument(
+        "--source-note",
+        help="source note name (e.g. Figure解读_<key>) for the anchor link back",
+    )
+    card_create_parser.add_argument(
+        "--backlink",
+        action="store_true",
+        help="insert '> 卡片：[[<card>]]' after the anchor in the source note "
+        "(explicit bidirectional link)",
+    )
+    card_create_parser.set_defaults(func=_cmd_card_create)
+
     return parser
 
 
@@ -635,6 +678,51 @@ def _cmd_migrate_rollback(args: argparse.Namespace) -> Envelope:
             "restored": list(result.restored),
         }
     )
+
+
+def _cmd_card_root(args: argparse.Namespace) -> Envelope:
+    raise UserError("missing card subcommand: use create")
+
+
+def _cmd_card_create(args: argparse.Namespace) -> Envelope:
+    selection_path = Path(args.selection_file)
+    try:
+        selection = selection_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise UserError(f"cannot read selection file {selection_path}: {exc}") from exc
+    result = _run_card(
+        lambda: cards.create_card(
+            Path(args.vault),
+            key=args.key,
+            title=args.title,
+            selection=selection,
+            filename=args.filename,
+            anchor_name=args.anchor_name,
+            source_note=args.source_note,
+            backlink=args.backlink,
+        )
+    )
+    data = {
+        "citation_key": result.citation_key,
+        "paper_id": result.paper_id,
+        "path": str(result.path),
+        "anchor_name": result.anchor_name,
+        "anchor_inserted": result.anchor_inserted,
+        "anchor_link": result.anchor_link,
+        "backlink_inserted": result.backlink_inserted,
+    }
+    warnings = [Issue(code="card_warning", message=w) for w in result.warnings]
+    return success(data, warnings=warnings)
+
+
+def _run_card(op: Any) -> Any:
+    """Translate core card errors onto the CLI's error hierarchy."""
+    try:
+        return op()
+    except cards.CardError as exc:
+        raise UserError(str(exc)) from exc
+    except cards.CardConflict as exc:
+        raise ConflictError(str(exc)) from exc
 
 
 def _cmd_config_easyscholar_import(args: argparse.Namespace) -> Envelope:

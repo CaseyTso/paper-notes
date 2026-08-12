@@ -135,7 +135,24 @@ paper: "[[<citation_key>]]"
 
 ## 文献卡片（cards/）
 
-`literature-card-from-figure-notes` skill 从已有 Figure解读 拆分卡片，落该篇 `<paper_dir>/cards/`；卡片只派生自本论文，frontmatter 用最小关系字段。
+从已有 Figure解读 拆分卡片**首选 CLI**（`paper-notes card create`），落该篇 `<paper_dir>/cards/`；卡片只派生自本论文，frontmatter 用最小关系字段（`paper_id` / `citation_key` / `paper` wikilink）。
+
+```bash
+cd <paper-notes-repo> && python3 -m paper_notes.cli card create \
+  --vault "<vault>" --key <citation_key> \
+  --title "<结论性的一句话>" \
+  --selection-file /tmp/selection.md \
+  [--filename card_Figure2_MyCard.md] \
+  --anchor-name fig2-interpretation --source-note "Figure解读_<citation_key>" \
+  [--backlink]
+```
+
+- `--selection-file`：选中内容的 verbatim Markdown（图片 embed、legend、四维解读原样）。
+- 默认文件名 `card_<slug>.md`（slug 由 title 生成，保留中文）；`--filename` 可覆盖。
+- 提供 `--anchor-name` + `--source-note` 时：CLI 在源 Figure解读 笔记的选区末尾幂等插入 `^anchor`，并在卡片中生成 `> 参见 [[Figure解读_<key>#^anchor|...]]` 回链。
+- **双链铁律**：创建卡片默认加 `--backlink`——CLI 在源笔记 anchor 行之后插入 `> 卡片：[[<card>]]`，使 Figure解读 → 卡片 也可见地可跳转（加上卡片内的 `参见` 回链即构成显式双向链接；Obsidian 的 Backlinks 面板会自动追踪两侧）。回链幂等，已存在则 `card_warning`。
+- 目标卡片已存在 → `conflict`（退出码 3，零写入）；源笔记无法定位选区末尾 → `card_warning` 但卡片仍创建。
+- 执行层薄封装见 `literature-card-from-figure-notes` skill；它负责读取选区、生成结论性标题，然后调用本 CLI。
 
 ## EasyScholar（UI-only：绝不写入 Markdown）
 
@@ -216,6 +233,9 @@ python3 -m paper_notes.cli migrate rollback <run_id>
 | Figure 渲染失败（主 PDF 打不开 / 页码或 bbox 越界 / dpi<300） | 检查 canonical 主 PDF 路径、caption 页码与 bbox；`render_pdf_figure.py` 非零退出且输出目录零写入，修复后重试；仍失败则写「原 PDF 未能可靠定位完整 Figure」 |
 | 迁移冲突（目标已有不同内容） | 停止交人工复核；绝不覆盖不同内容 |
 | YAML 非法 / 文件与元数据不一致 | 条目保持可见并给字段级诊断；`item reconcile` 提议修正；绝不静默覆盖人工编辑 |
+| `card create` 目标已存在 | `conflict`（退出码 3）零写入；换标题/文件名重跑 |
+| `card create` 源笔记定位失败 | `card_warning`：卡片已创建但 anchor 未插入，手动补 anchor 或去掉 `--anchor-name` |
+| `card create` 回链已存在 | `card_warning`：`> 卡片：[[...]]` 已在源笔记中，幂等 no-op |
 
 ## 注意事项
 
@@ -233,7 +253,7 @@ python3 -m paper_notes.cli migrate rollback <run_id>
 4. **MinerU CDN SSL + 本地代理冲突**——Python `requests` 对 `cdn-mineru.openxlab.org.cn` 常报 `SSLEOFError`。脚本内置 `curl` 回退。但若本地有 HTTPS 代理，curl 也会因代理隧道的 TLS 握手失败。**解法**：`curl --noproxy cdn-mineru.openxlab.org.cn -L -o <zip> <url>` 或 `unset HTTP_PROXY HTTPS_PROXY` 后重试。也可用 `--noproxy '*'` 全局绕过代理下载。
 5. **MinerU 输出目录禁止指向 `figures/`**——临时解析产物绝不落最终 figure 资产目录；`mineru_upload.py` / `clean_md.py` 会直接拒绝。
 6. **write_file 对中文路径静默失败**——Hermes `write_file` / `execute_code` 在路径含中文（如 `知识库`）时可能报成功但不落盘。**必须用 `terminal` + Python `Path.write_text`**。另：**`terminal` 的 `workdir` 不能含中文**（会 Blocked: disallowed character）——省略 workdir 或用英文 cwd，绝对路径写在 Python 字符串内。
-7. **独立 Figure解读 ≠ 文献卡片**——`literature-card-from-figure-notes` 只从已有 Figure解读拆卡片（落 `cards/`）；**写完整 Figure解读**走本 skill「创建 Figure解读笔记」/ `references/figure_interpretation.md`。
+7. **独立 Figure解读 ≠ 文献卡片**——`literature-card-from-figure-notes` 从已有 Figure解读拆卡片（落 `cards/`，核心写盘走 `paper-notes card create` CLI）；**写完整 Figure解读**走本 skill「创建 Figure解读笔记」/ `references/figure_interpretation.md`。
 8. **SM 图注不在 minerUmd 里**——先扫 PDF 页数与是否含 `Fig. S`；仅有主文时用正文 `fig. Sx` + Methods 逐图归纳补充图 legend 并声明归纳来源，勿假装有完整 SM legend。
 9. **Figure解读 提问须先查原文**——当用户针对 Figure解读 笔记提问（如"这个方法怎么做的""这个术语什么意思"），必须先查阅同目录下的 `minerUmd_*.md` 原文 Methods 部分，用原文的实际方法作答，而非依赖一般性推测或常见做法。教训：曾将 signature scoring 方法推测为 AUCell/H 矩阵，实为 Seurat AddModuleScore + 30-bin 对照基因方案（原文 Methods "Scoring gene sets" 明确写了公式）。先查原文再答，避免知识污染。
 10. **OSS 上传在本地代理下极慢 / 易超时**——`mineru.oss-cn-shanghai.aliyuncs.com` 经本地 HTTPS 代理时实测约 15–40 KB/s。**优先**：PyMuPDF 压到 ~120dpi JPEG（**仅供 MinerU OCR，最终插图从 canonical 主 PDF 渲染**）再 `curl PUT --data-binary`（无 Content-Type、走代理、长超时）；见 `references/mineru_upload_proxy.md`。不要对 OSS 用 `--noproxy '*'`（本环境曾卡在 Expect:100）。
