@@ -24,7 +24,7 @@ Obsidian-native 文献管理系统：vault 内的 Markdown/YAML 与文件是持�
 ## 工作流
 
 - **条目管理**：`python3 -m paper_notes.cli item create|show|update|attach-pdf|reconcile|rename-key|delete`，`--json` envelope（`protocol_version` / `needs_confirmation`，退出码 0/2/3/4）。见 `references/cli_protocol.md`。
-- **Library UX（插件 UI）**——Row Activation、Detail Drawer、Open Folder、Reading Status Cycle 与 Journal Metrics 交互见 `SKILL.md`「## Library UX（Obsidian 插件交互）」.
+- **Library UX（插件 UI）**——Row Activation、Detail Drawer、Open Folder、Reading Status Cycle 与 Journal Metrics 交互见 `SKILL.md`「## Library UX（Obsidian 插件交互）」。
 - **MinerU 转换与 Figure 解读仍是 Hermesian + paper-notes skill 工作流**（Obsidian 插件从不启动它们）：`scripts/mineru_upload.py --citation-key <key>` 定稿 `minerUmd_<citation_key>.md`；`scripts/clean_md.py` 把临时 MinerU 图片迁移进 `<paper_dir>/attachments/`；`scripts/render_pdf_figure.py` 从 canonical 主 PDF 渲染 ≥300dpi 完整整图到 `<paper_dir>/figures/`（内容哈希文件名，两篇笔记共享同一 embed）。Figure 解读质量规则（Overview、整图嵌入、source Methods、不猜 panel）见 `references/figure_interpretation.md`。
 - **迁移**：`migrate legacy-obsidian --dry-run|--apply <run_id>`、`migrate verify <run_id>`、`migrate rollback <run_id>`；备份在 vault 外 `~/Library/Application Support/paper-notes/migrations/<run_id>/`，永不自动删除。
 
