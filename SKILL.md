@@ -154,9 +154,18 @@ cd <paper-notes-repo> && python3 -m paper_notes.cli card create \
 - 目标卡片已存在 → `conflict`（退出码 3，零写入）；源笔记无法定位选区末尾 → `card_warning` 但卡片仍创建。
 - 执行层薄封装见 `literature-card-from-figure-notes` skill；它负责读取选区、生成结论性标题，然后调用本 CLI。
 
+## Library UX（Obsidian 插件交互）
+
+Obsidian 插件提供文献库（Library）表格视图与 Detail Drawer（右侧详情抽屉）。这些交互由插件 UI 实现，回答相关操作问题时按此描述：
+
+- **Row Activation（行激活）**：**单击行** = 选中该行并打开 Detail Drawer（只读详情 + 操作）；**双击行** = 只打开 Primary PDF（`<citation_key>.pdf`）；该行**缺 PDF 时双击仅弹 Notice**——不开 Drawer、不开 Figure 笔记。
+- **Open Folder**：Detail Drawer 内按钮；在 **Obsidian 应用内文件 explorer** 中 reveal Canonical Paper Directory（`05 Literature/<key>/`），explorer 未开则打开；**不是 macOS Finder**。
+- **Reading Status Cycle（阅读状态循环）**：表格单元格与 drawer header 的 reading chip 均可点击；点击循环 `unread → reading → read → unread`，经 CLI `item update` 写入主条目 frontmatter `reading_status`。**Chip-Local Click**——chip 点击只循环状态，不冒泡为行激活（不打开/切换 Drawer）；action bar 的 `Reading: x → y` 快捷按钮已移除，不再使用。
+- **Journal Metrics（期刊指标）**：见下节「EasyScholar」——CAS/JCR/IF/JCI 为 volatile UI-only，只在插件 UI 展示（列徽章 + drawer 段），绝不写入任何 Markdown。
+
 ## EasyScholar（UI-only：绝不写入 Markdown）
 
-EasyScholar 指标是 **volatile UI-only 数据（仅插件界面展示）**，**绝不写入**任何 Markdown（不写入主条目、派生笔记、卡片与索引）。SecretKey 存放在 vault 外私有配置（`~/Library/Application Support/paper-notes/config.json`，0600），插件调 CLI 查询、不显示不记录密钥；CLI 提供 `metrics query` 与 `config easyscholar`（一次性从旧 Zotero 配置导入需显式确认，不打印值）。缓存 30 天、失败保留旧值并标记 stale，绝不影响检索/引用/导出。
+Journal Metrics（CAS/JCR/IF/JCI）是 **volatile UI-only 数据（仅插件界面展示：列徽章 + Detail Drawer 段）**，**唯一来源是 EasyScholar**（与 Zotero zotero-style / Ethereal Style 插件**同源数据族**），**绝不写入**任何 Markdown（不写入主条目、派生笔记、卡片与索引）。SecretKey 存放在 vault 外私有配置（`~/Library/Application Support/paper-notes/config.json`，0600），插件调 CLI 查询、不显示不记录密钥；CLI 提供 `metrics query` 与 `config easyscholar`（一次性从旧 Zotero 配置导入需显式确认，不打印值）。缓存 30 天、失败保留旧值并标记 stale，绝不影响检索/引用/导出。
 
 ## 迁移（legacy Obsidian → canonical）
 

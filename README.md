@@ -24,6 +24,7 @@ Obsidian-native literature management: portable Markdown/YAML and files in the O
 ## Workflows
 
 - **Item management** — `python3 -m paper_notes.cli item create|show|update|attach-pdf|reconcile|rename-key|delete` with `--json` envelopes (`protocol_version`, `needs_confirmation`, exit codes 0/2/3/4). See `references/cli_protocol.md`.
+- **Library UX（plugin UI）** — Row Activation, Detail Drawer, Open Folder, Reading Status Cycle, and Journal Metrics interactions: see `SKILL.md`「## Library UX（Obsidian 插件交互）」.
 - **MinerU conversion and Figure interpretation remain a Hermesian + paper-notes skill workflow** (the Obsidian plugin never starts them): `scripts/mineru_upload.py --citation-key <key>` finalizes `minerUmd_<citation_key>.md`; `scripts/clean_md.py` migrates temporary MinerU images into `<paper_dir>/attachments/`; `scripts/render_pdf_figure.py` renders ≥300-dpi full figures from the canonical primary PDF into `<paper_dir>/figures/` (content-hash filenames, both notes share the same embed). Figure interpretation quality rules (Overview, full-figure embeds, source Methods, no guessed panels) are detailed in `references/figure_interpretation.md`.
 - **Migration** — `migrate legacy-obsidian --dry-run|--apply <run_id>`, `migrate verify <run_id>`, `migrate rollback <run_id>`; backups live outside the vault under `~/Library/Application Support/paper-notes/migrations/<run_id>/` and are never auto-deleted.
 
