@@ -14,7 +14,7 @@ import traceback
 from pathlib import Path
 from typing import Any, NoReturn
 
-from . import __version__, attachments, cards, citations, config, csl, deletion, items
+from . import __version__, attachments, cards, citations, config, csl, deletion, items, mocs
 from .identifiers import extract_identifiers, parse_arxiv, parse_doi, parse_pmcid, parse_pmid
 from .protocol import (
     EXIT_CONFLICT,
@@ -398,6 +398,25 @@ def build_parser(json_mode: bool) -> _JsonAwareArgumentParser:
     )
     card_create_parser.set_defaults(func=_cmd_card_create)
 
+    moc_parser = subparsers.add_parser(
+        "moc",
+        help="create Topic MOC notes under 05 Literature/MOCs/",
+        json_mode=json_mode,
+    )
+    moc_parser.set_defaults(func=_cmd_moc_root)
+    moc_subparsers = moc_parser.add_subparsers(dest="moc_command")
+
+    moc_create_parser = moc_subparsers.add_parser(
+        "create",
+        help="create a Topic MOC note (kind: topic-moc, empty four-column table)",
+        json_mode=json_mode,
+    )
+    moc_create_parser.add_argument("--vault", required=True, help="vault root directory")
+    moc_create_parser.add_argument(
+        "--title", required=True, help="theme name (also the filename stem; CJK ok)"
+    )
+    moc_create_parser.set_defaults(func=_cmd_moc_create)
+
     return parser
 
 
@@ -722,6 +741,34 @@ def _run_card(op: Any) -> Any:
     except cards.CardError as exc:
         raise UserError(str(exc)) from exc
     except cards.CardConflict as exc:
+        raise ConflictError(str(exc)) from exc
+
+
+def _cmd_moc_root(args: argparse.Namespace) -> Envelope:
+    raise UserError("missing moc subcommand: use create")
+
+
+def _cmd_moc_create(args: argparse.Namespace) -> Envelope:
+    vault = Path(args.vault)
+    result = _run_moc(
+        lambda: mocs.create_moc(vault, title=args.title)
+    )
+    rel_path = result.path.relative_to(vault) if result.path.is_absolute() else result.path
+    data = {
+        "title": result.title,
+        "path": str(rel_path),
+        "kind": "topic-moc",
+    }
+    return success(data)
+
+
+def _run_moc(op: Any) -> Any:
+    """Translate core MOC errors onto the CLI's error hierarchy."""
+    try:
+        return op()
+    except mocs.MocError as exc:
+        raise UserError(str(exc)) from exc
+    except mocs.MocConflict as exc:
         raise ConflictError(str(exc)) from exc
 
 

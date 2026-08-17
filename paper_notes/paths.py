@@ -43,6 +43,11 @@ def literature_root(vault_root: Path) -> Path:
     return vault_root / LITERATURE_ROOT
 
 
+def moc_folder(vault_root: Path) -> Path:
+    """Directory that holds Topic MOC notes (not a paper directory)."""
+    return literature_root(vault_root) / "MOCs"
+
+
 def paper_directory(vault_root: Path, key: str) -> Path:
     _require_key(key)
     return literature_root(vault_root) / key

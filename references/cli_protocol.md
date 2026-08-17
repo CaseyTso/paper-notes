@@ -7,6 +7,7 @@
 ```text
 paper-notes item create|show|update|attach-pdf|reconcile|rename-key|delete
 paper-notes card create
+paper-notes moc create
 paper-notes index rebuild|validate-manuscript
 paper-notes metrics query
 paper-notes config easyscholar
@@ -18,6 +19,7 @@ paper-notes version
 - `item attach-pdf`：主 PDF 复制进 `<paper_dir>/`（SHA-256 校验，源文件不移动不删除）；补充文件进 `attachments/`。
 - `item rename-key` / `item delete`：先 dry-run 影响清单，再确认执行；重命名是 parser-aware 的事务性全局重命名，旧 key 追加到 `citation_key_aliases`。
 - `card create`：从 Figure解读 选区派生卡片，落 `<paper_dir>/cards/`；需要 `--vault` / `--key` / `--title` / `--selection-file`；可选 `--filename`（覆盖 `card_<slug>.md` 默认名）、`--anchor-name` + `--source-note`（在源笔记选区末尾幂等插入 `^anchor` 并生成回链）、`--backlink`（在源笔记 anchor 后插入 `> 卡片：[[<card>]]` 构成显式双链）。目标已存在 → `conflict`；选区无法定位 → `card_warning`（卡片仍创建）；回链已存在 → `card_warning`（幂等）。
+- `moc create`：在 `05 Literature/MOCs/` 下创建 Topic MOC 笔记（`kind: topic-moc` + 空四列表格）；需要 `--vault` / `--title`（即文件名，CJK 保留）；目标已存在 → `conflict`；空标题或含路径分隔符 → `error`。
 - `index rebuild`：确定性重建 `.paper-notes/library.json` 与 `citation-aliases.json`；生成文件不得手改。
 - `migrate legacy-obsidian`：只读发现 + 迁移计划（详见 `migration.md`）。
 

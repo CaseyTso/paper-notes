@@ -216,9 +216,9 @@ python3 -m paper_notes.cli migrate rollback <run_id>
 - 主文体量通常 >10KB
 - 遵循 `references/figure_interpretation.md` 完整规范
 
-## 文献笔记总览 / 主题表填行（可选但常见）
+## Topic MOC / 主题表填行（可选但常见）
 
-导入后常写入 `05 Literature/🗺️文献笔记总览.md` 某主题表（如「单细胞milo分析」），列固定 **Title | Figure解读 | 总结**：
+导入后常写入 `05 Literature/MOCs/<主题>.md` 的 Topic Table（如「单细胞milo分析」），列固定 **Title | Figure解读 | 总结 | 卡片**：
 
 1. **Title**：完整英文标题（与同文件其它表一致，不用 citekey）
 2. **Figure解读**：`[[Figure解读_<citation_key>]]`（仅笔记名）
