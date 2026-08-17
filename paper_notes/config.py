@@ -1,10 +1,11 @@
 """Private configuration for paper-notes.
 
-Secrets (currently the EasyScholar SecretKey) live outside the vault in
-``~/Library/Application Support/paper-notes/config.json`` with mode
-``0600``. JSON output and exception messages never carry the secret
-value: :func:`mask_secret`, :func:`redacted_config`, and
-:func:`redact_text` are the only rendering surfaces for humans.
+Secrets (the EasyScholar SecretKey and the MinerU Key) live outside the
+vault in ``~/Library/Application Support/paper-notes/config.json`` with
+mode ``0600``. JSON output and exception messages never carry either
+secret value: :func:`mask_secret`, :func:`redacted_config`, and
+:func:`redact_text` / :func:`redact_config_text` are the only rendering
+surfaces for humans.
 
 ``PAPER_NOTES_CONFIG`` overrides the location for tests and for
 non-macOS layouts; the default is the macOS Application Support path.
@@ -30,10 +31,15 @@ class Config:
     """Private settings; the secret value never appears in reprs."""
 
     easyscholar_secret_key: str | None = None
+    mineru_key: str | None = None
 
     def __repr__(self) -> str:
-        key = MASK if self.easyscholar_secret_key else None
-        return f"Config(easyscholar_secret_key={key!r})"
+        es_key = MASK if self.easyscholar_secret_key else None
+        mineru_key = MASK if self.mineru_key else None
+        return (
+            f"Config(easyscholar_secret_key={es_key!r}, "
+            f"mineru_key={mineru_key!r})"
+        )
 
     def __str__(self) -> str:
         return self.__repr__()
@@ -67,7 +73,10 @@ def load_config(path: Path | None = None) -> Config:
     key = raw.get("easyscholar_secret_key")
     if not isinstance(key, str) or not key:
         key = None
-    return Config(easyscholar_secret_key=key)
+    mineru_key = raw.get("mineru_key")
+    if not isinstance(mineru_key, str) or not mineru_key:
+        mineru_key = None
+    return Config(easyscholar_secret_key=key, mineru_key=mineru_key)
 
 
 def save_config(cfg: Config, path: Path | None = None) -> None:
@@ -97,11 +106,13 @@ def mask_secret(value: str) -> str:
 
 
 def redacted_config(cfg: Config, path: Path | None = None) -> dict:
-    """Config as a dict with the secret replaced by the fixed mask."""
+    """Config as a dict with every secret replaced by the fixed mask."""
     config_path = Path(path) if path is not None else default_config_path()
     data = asdict(cfg)
     if data.get("easyscholar_secret_key"):
         data["easyscholar_secret_key"] = MASK
+    if data.get("mineru_key"):
+        data["mineru_key"] = MASK
     return {"config_path": str(config_path), **data}
 
 
@@ -110,3 +121,9 @@ def redact_text(text: str, secret: str | None) -> str:
     if not secret:
         return text
     return text.replace(secret, MASK)
+
+
+def redact_config_text(text: str, cfg: Config) -> str:
+    """Redact every configured secret (EasyScholar + MinerU) from ``text``."""
+    text = redact_text(text, cfg.easyscholar_secret_key)
+    return redact_text(text, cfg.mineru_key)

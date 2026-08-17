@@ -14,7 +14,18 @@ import traceback
 from pathlib import Path
 from typing import Any, NoReturn
 
-from . import __version__, attachments, cards, citations, config, csl, deletion, items, mocs
+from . import (
+    __version__,
+    attachments,
+    cards,
+    citations,
+    config,
+    csl,
+    deletion,
+    items,
+    mineru,
+    mocs,
+)
 from .identifiers import extract_identifiers, parse_arxiv, parse_doi, parse_pmcid, parse_pmid
 from .protocol import (
     EXIT_CONFLICT,
@@ -270,6 +281,37 @@ def build_parser(json_mode: bool) -> _JsonAwareArgumentParser:
     )
     import_parser.set_defaults(func=_cmd_config_easyscholar_import)
 
+    mineru_parser = config_subparsers.add_parser(
+        "mineru",
+        help="MinerU private settings",
+        json_mode=json_mode,
+    )
+    mineru_parser.set_defaults(func=_cmd_config_mineru_root)
+    mineru_subparsers = mineru_parser.add_subparsers(dest="mineru_command")
+    mineru_status_parser = mineru_subparsers.add_parser(
+        "status",
+        help="report whether a MinerU key is configured (never the value)",
+        json_mode=json_mode,
+    )
+    mineru_status_parser.set_defaults(func=_cmd_config_mineru_status)
+    mineru_set_parser = mineru_subparsers.add_parser(
+        "set-key",
+        help="save the MinerU key read from stdin (never printed)",
+        json_mode=json_mode,
+    )
+    mineru_set_parser.add_argument(
+        "--stdin",
+        action="store_true",
+        help="read exactly one line (the key) from stdin and store it",
+    )
+    mineru_set_parser.set_defaults(func=_cmd_config_mineru_set_key)
+    mineru_delete_parser = mineru_subparsers.add_parser(
+        "delete-key",
+        help="remove the stored MinerU key (idempotent)",
+        json_mode=json_mode,
+    )
+    mineru_delete_parser.set_defaults(func=_cmd_config_mineru_delete_key)
+
     migrate_parser = subparsers.add_parser(
         "migrate",
         help="plan or apply legacy Obsidian migrations",
@@ -417,6 +459,31 @@ def build_parser(json_mode: bool) -> _JsonAwareArgumentParser:
     )
     moc_create_parser.set_defaults(func=_cmd_moc_create)
 
+    mineru_parser = subparsers.add_parser(
+        "mineru",
+        help="convert a paper's Primary PDF through MinerU (core-owned writes)",
+        json_mode=json_mode,
+    )
+    mineru_parser.set_defaults(func=_cmd_mineru_root)
+    mineru_subparsers = mineru_parser.add_subparsers(dest="mineru_command")
+    convert_parser = mineru_subparsers.add_parser(
+        "convert",
+        help="convert an item's Primary PDF (fresh or confirmed re-convert)",
+        json_mode=json_mode,
+    )
+    convert_parser.add_argument("--vault", required=True, help="vault root directory")
+    convert_parser.add_argument("--key", required=True, help="citation key or alias")
+    convert_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="preview a re-convert and return a confirmation token without writing",
+    )
+    convert_parser.add_argument(
+        "--confirm-token",
+        help="confirmation token from a previous mineru convert --dry-run",
+    )
+    convert_parser.set_defaults(func=_cmd_mineru_convert)
+
     return parser
 
 
@@ -508,11 +575,68 @@ def _cmd_metrics_query(args: argparse.Namespace) -> Envelope:
 
 
 def _cmd_config_root(args: argparse.Namespace) -> Envelope:
-    raise UserError("missing config subcommand: use easyscholar")
+    raise UserError("missing config subcommand: use easyscholar or mineru")
 
 
 def _cmd_config_easyscholar_root(args: argparse.Namespace) -> Envelope:
     raise UserError("missing easyscholar subcommand: use import-zotero")
+
+
+def _cmd_config_mineru_root(args: argparse.Namespace) -> Envelope:
+    raise UserError("missing mineru subcommand: use status, set-key, or delete-key")
+
+
+def _cmd_config_mineru_status(args: argparse.Namespace) -> Envelope:
+    cfg = config.load_config()
+    return success(
+        {
+            "configured": bool(cfg.mineru_key),
+            "config_path": str(config.default_config_path()),
+        }
+    )
+
+
+def _cmd_config_mineru_set_key(args: argparse.Namespace) -> Envelope:
+    if not args.stdin:
+        raise UserError(
+            "config mineru set-key requires --stdin; the key is read from "
+            "stdin so it never appears in argv or logs"
+        )
+    raw = sys.stdin.read()
+    key = raw.strip()
+    if not key:
+        raise UserError("no MinerU key received on stdin")
+    cfg = config.load_config()
+    config.save_config(
+        config.Config(easyscholar_secret_key=cfg.easyscholar_secret_key, mineru_key=key)
+    )
+    return success(
+        {
+            "configured": True,
+            "config_path": str(config.default_config_path()),
+        }
+    )
+
+
+def _cmd_config_mineru_delete_key(args: argparse.Namespace) -> Envelope:
+    cfg = config.load_config()
+    if not cfg.mineru_key:
+        # idempotent: nothing configured, nothing to remove
+        return success(
+            {
+                "configured": False,
+                "config_path": str(config.default_config_path()),
+            }
+        )
+    config.save_config(
+        config.Config(easyscholar_secret_key=cfg.easyscholar_secret_key, mineru_key=None)
+    )
+    return success(
+        {
+            "configured": False,
+            "config_path": str(config.default_config_path()),
+        }
+    )
 
 
 def _cmd_migrate_root(args: argparse.Namespace) -> Envelope:
@@ -770,6 +894,59 @@ def _run_moc(op: Any) -> Any:
         raise UserError(str(exc)) from exc
     except mocs.MocConflict as exc:
         raise ConflictError(str(exc)) from exc
+
+
+def _cmd_mineru_root(args: argparse.Namespace) -> Envelope:
+    raise UserError("missing mineru subcommand: use convert")
+
+
+def _cmd_mineru_convert(args: argparse.Namespace) -> Envelope:
+    from .protocol import needs_confirmation
+
+    if args.dry_run and args.confirm_token:
+        raise UserError("cannot combine --dry-run with --confirm-token")
+
+    def progress(event: dict) -> None:
+        # NDJSON progress lines (plugin stream contract); human mode is
+        # silent so stdout stays a single envelope.
+        if args.json:
+            print(json.dumps({"type": "progress", **event}, ensure_ascii=False))
+
+    try:
+        if args.dry_run:
+            preview = mineru.preview_convert(Path(args.vault), key=args.key)
+            return needs_confirmation(
+                {
+                    "action": "mineru_convert",
+                    "citation_key": preview.citation_key,
+                    "paper_id": preview.paper_id,
+                    "existing_md": preview.existing_md,
+                    "pdf_sha256": preview.pdf_sha256,
+                    "old_md_sha256": preview.old_md_sha256,
+                    "confirmation_token": preview.confirmation_token,
+                    "plan": preview.plan,
+                }
+            )
+        result = mineru.run_convert(
+            Path(args.vault),
+            key=args.key,
+            confirm_token=args.confirm_token,
+            progress=progress,
+        )
+    except mineru.MineruError as exc:
+        raise UserError(config.redact_config_text(str(exc), config.load_config())) from exc
+    except mineru.MineruConflict as exc:
+        raise ConflictError(config.redact_config_text(str(exc), config.load_config())) from exc
+    return success(
+        {
+            "action": result.action,
+            "citation_key": result.citation_key,
+            "paper_id": result.paper_id,
+            "path": result.path,
+            "images": result.images,
+            "total_pages": result.total_pages,
+        }
+    )
 
 
 def _cmd_config_easyscholar_import(args: argparse.Namespace) -> Envelope:

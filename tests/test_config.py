@@ -126,7 +126,8 @@ class ConfigReprTest(unittest.TestCase):
 
     def test_repr_without_secret_shows_none(self):
         self.assertEqual(
-            repr(config.Config()), "Config(easyscholar_secret_key=None)"
+            repr(config.Config()),
+            "Config(easyscholar_secret_key=None, mineru_key=None)",
         )
 
 

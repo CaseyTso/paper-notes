@@ -45,6 +45,9 @@ OPERATIONS = frozenset(
         "refresh",
         "migrate",
         "show",
+        "mineru_preview",
+        "mineru_convert",
+        "mineru_commit",
     }
 )
 
