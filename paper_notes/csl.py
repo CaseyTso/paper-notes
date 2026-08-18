@@ -97,6 +97,47 @@ def paper_to_csl(paper: Paper) -> dict[str, Any]:
     if paper.publication_date is not None:
         parts = [int(part) for part in paper.publication_date.split("-")]
         entry["issued"] = {"date-parts": [parts]}
+    journal = getattr(paper, "journal", None)
+    if journal:
+        entry["container-title"] = journal
+    journal_abbreviation = getattr(paper, "journal_abbreviation", None)
+    if journal_abbreviation:
+        entry["container-title-short"] = journal_abbreviation
+    volume = getattr(paper, "volume", None)
+    if volume:
+        entry["volume"] = volume
+    issue = getattr(paper, "issue", None)
+    if issue:
+        entry["issue"] = issue
+    pages = getattr(paper, "pages", None)
+    if pages:
+        entry["page"] = pages
+    doi = getattr(paper, "doi", None)
+    if doi:
+        entry["DOI"] = doi
+    url = getattr(paper, "url", None)
+    if url:
+        entry["URL"] = url
+    issn = getattr(paper, "issn", None)
+    if issn:
+        entry["ISSN"] = list(issn)
+    language = getattr(paper, "language", None)
+    if language:
+        entry["language"] = language
+    abstract = getattr(paper, "abstract", None)
+    if abstract:
+        entry["abstract"] = abstract
+    # Useful identifier extensions; not part of the core CSL-JSON spec but
+    # harmless for downstream consumers and never internal bookkeeping.
+    pmid = getattr(paper, "pmid", None)
+    if pmid:
+        entry["PMID"] = pmid
+    pmcid = getattr(paper, "pmcid", None)
+    if pmcid:
+        entry["PMCID"] = pmcid
+    arxiv = getattr(paper, "arxiv", None)
+    if arxiv:
+        entry["arXiv"] = arxiv
     return entry
 
 

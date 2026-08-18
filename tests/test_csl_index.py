@@ -196,6 +196,97 @@ class PaperToCslTest(unittest.TestCase):
         self.assertNotIn("field_provenance", csl)
 
 
+    def test_full_canonical_bibliography_mapping(self):
+        paper = Paper(
+            paper_id="550e8400-e29b-41d4-a716-446655440000",
+            citation_key="full2026",
+            item_type="article-journal",
+            title="Full paper",
+            authors=[
+                {"family": "Smith", "given": "J."},
+                {"literal": "Study Group"},
+            ],
+            publication_date="2026-05-01",
+            journal="Journal of Tests",
+            journal_abbreviation="J Tests",
+            volume="12",
+            issue="3",
+            pages="100-110",
+            doi="10.1000/full",
+            url="https://doi.org/10.1000/full",
+            issn=["1234-5678", "8765-4321"],
+            language="en",
+            abstract="An abstract",
+            pmid="28845751",
+            pmcid="PMC1234567",
+            arxiv="2401.00001",
+        )
+        from paper_notes.csl import paper_to_csl
+
+        csl = paper_to_csl(paper)
+        self.assertEqual(csl["id"], "full2026")
+        self.assertEqual(csl["type"], "article-journal")
+        self.assertEqual(csl["title"], "Full paper")
+        self.assertEqual(
+            csl["author"],
+            [{"family": "Smith", "given": "J."}, {"literal": "Study Group"}],
+        )
+        self.assertEqual(csl["issued"], {"date-parts": [[2026, 5, 1]]})
+        self.assertEqual(csl["container-title"], "Journal of Tests")
+        self.assertEqual(csl["container-title-short"], "J Tests")
+        self.assertEqual(csl["volume"], "12")
+        self.assertEqual(csl["issue"], "3")
+        self.assertEqual(csl["page"], "100-110")
+        self.assertEqual(csl["DOI"], "10.1000/full")
+        self.assertEqual(csl["URL"], "https://doi.org/10.1000/full")
+        self.assertEqual(csl["ISSN"], ["1234-5678", "8765-4321"])
+        self.assertEqual(csl["language"], "en")
+        self.assertEqual(csl["abstract"], "An abstract")
+        self.assertEqual(csl["PMID"], "28845751")
+        self.assertEqual(csl["PMCID"], "PMC1234567")
+        self.assertEqual(csl["arXiv"], "2401.00001")
+
+    def test_partial_fields_are_omitted_not_empty(self):
+        paper = Paper(
+            paper_id="550e8400-e29b-41d4-a716-446655440000",
+            citation_key="partial2026",
+            title="Partial",
+            publication_date="2026",
+            journal="",
+            journal_abbreviation="",
+            volume="",
+            issue="",
+            pages="",
+            doi="",
+            url="",
+            issn=[],
+            language="",
+            abstract="",
+            pmid="",
+            pmcid="",
+            arxiv="",
+        )
+        from paper_notes.csl import paper_to_csl
+
+        csl = paper_to_csl(paper)
+        for key in (
+            "container-title",
+            "container-title-short",
+            "volume",
+            "issue",
+            "page",
+            "DOI",
+            "URL",
+            "ISSN",
+            "language",
+            "abstract",
+            "PMID",
+            "PMCID",
+            "arXiv",
+        ):
+            self.assertNotIn(key, csl)
+
+
 class RenderIndexTest(unittest.TestCase):
     def test_deterministic_byte_output(self):
         from paper_notes.csl import render_alias_map, render_library

@@ -27,6 +27,7 @@ from . import (
     mocs,
 )
 from .identifiers import extract_identifiers, parse_arxiv, parse_doi, parse_pmcid, parse_pmid
+from .web_capture import WebCaptureRequest
 from .protocol import (
     EXIT_CONFLICT,
     EXIT_INTERNAL_ERROR,
@@ -105,6 +106,14 @@ def build_parser(json_mode: bool) -> _JsonAwareArgumentParser:
     create_parser.add_argument(
         "--confirmed",
         help="JSON file with user-confirmed metadata values",
+    )
+    create_parser.add_argument(
+        "--web-capture",
+        help="JSON file with a Browser Connector Web Capture (schema v1)",
+    )
+    create_parser.add_argument(
+        "--confirm-token",
+        help="opaque confirmation token from a Web Capture review plan",
     )
     create_parser.set_defaults(func=_cmd_item_create)
 
@@ -1042,22 +1051,54 @@ def _run_item(op: Any) -> Any:
 
 def _cmd_item_create(args: argparse.Namespace) -> Envelope:
     from .protocol import needs_confirmation
+    from pydantic import ValidationError
 
-    identifiers = _parse_identifier_args(args)
     confirmed = (
         _load_json_file(args.confirmed, "confirmed metadata")
         if args.confirmed
         else None
     )
-    pdf = Path(args.pdf) if args.pdf else None
-    result = _run_item(
-        lambda: items.create_item(
-            Path(args.vault),
-            identifiers=identifiers,
-            pdf=pdf,
-            confirmed=confirmed,
+
+    if args.web_capture:
+        if (
+            args.doi
+            or args.pmid
+            or args.pmcid
+            or args.arxiv
+            or args.url
+            or args.pdf
+        ):
+            raise UserError(
+                "--web-capture cannot be combined with legacy create sources"
+            )
+        data = _load_json_file(args.web_capture, "web capture")
+        try:
+            capture = WebCaptureRequest.model_validate(data)
+        except ValidationError as exc:
+            details = "; ".join(
+                f"{'.'.join(str(p) for p in err.get('loc', ()))}: {err.get('msg', '')}"
+                for err in exc.errors()
+            )
+            raise UserError(f"invalid web capture: {details}") from exc
+        result = _run_item(
+            lambda: items.create_item_from_web_capture(
+                Path(args.vault),
+                capture=capture,
+                confirmed=confirmed,
+                confirm_token=args.confirm_token,
+            )
         )
-    )
+    else:
+        identifiers = _parse_identifier_args(args)
+        pdf = Path(args.pdf) if args.pdf else None
+        result = _run_item(
+            lambda: items.create_item(
+                Path(args.vault),
+                identifiers=identifiers,
+                pdf=pdf,
+                confirmed=confirmed,
+            )
+        )
     base = {
         "citation_key": result.citation_key,
         "paper_id": result.paper_id,

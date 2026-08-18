@@ -18,6 +18,7 @@ paper-notes version
 ```
 
 - `item create`：接受 `--doi` / `--pmid` / `--pmcid` / `--arxiv` / `--url` / `--pdf`（可重复），需要 `--vault`；从结构化来源（PubMed/Crossref/arXiv 等）取元数据，冲突或关键字段缺失时返回 `needs_confirmation` 候选值；`--confirmed <json>` 提供用户确认值。
+- `item create --web-capture <json>`：接受 Browser Connector V1 Web Capture（schema v1，严格字段白名单）。网页证据永不视为 `confirmed`；官方来源优先，冲突/缺关键字段/疑似重复进入 `needs_confirmation`。复审提交使用 `--confirmed <json>` + `--confirm-token <token>`；token 绑定 capture 载荷、动作与目标指纹，陈旧/重放/不匹配 → `conflict`（rc 3，零写入）。`--web-capture` 不得与 `--doi/--pmid/--pmcid/--arxiv/--url/--pdf` 组合。
 - `item attach-pdf`：主 PDF 复制进 `<paper_dir>/`（SHA-256 校验，源文件不移动不删除）；补充文件进 `attachments/`。
 - `item rename-key` / `item delete`：先 dry-run 影响清单，再确认执行；重命名是 parser-aware 的事务性全局重命名，旧 key 追加到 `citation_key_aliases`。
 - `card create`：从 Figure解读 选区派生卡片，落 `<paper_dir>/cards/`；需要 `--vault` / `--key` / `--title` / `--selection-file`；可选 `--filename`（覆盖 `card_<slug>.md` 默认名）、`--anchor-name` + `--source-note`（在源笔记选区末尾幂等插入 `^anchor` 并生成回链）、`--backlink`（在源笔记 anchor 后插入 `> 卡片：[[<card>]]` 构成显式双链）。目标已存在 → `conflict`；选区无法定位 → `card_warning`（卡片仍创建）；回链已存在 → `card_warning`（幂等）。

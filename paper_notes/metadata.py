@@ -18,8 +18,10 @@ vocabulary; :func:`merge_records` folds them into one
   publication_date) mean the record must not be auto-created.
 
 Source priority for provenance and conflict ordering: crossref, pubmed,
-arxiv, ai. ``publication_date`` comparison is precision-aware
-(``2024-05-01`` and ``2024-05`` agree); the more precise value wins.
+arxiv, then web evidence sources (web_highwire, web_json_ld,
+web_dublin_core, web_open_graph, web_doi_scan), then ai.
+``publication_date`` comparison is precision-aware (``2024-05-01`` and
+``2024-05`` agree); the more precise value wins.
 """
 
 from __future__ import annotations
@@ -34,7 +36,17 @@ from paper_notes.identifiers import ParsedIdentifier
 
 Confidence = Literal["high", "needs_confirmation"]
 
-SOURCE_PRIORITY = ("crossref", "pubmed", "arxiv", "ai")
+SOURCE_PRIORITY = (
+    "crossref",
+    "pubmed",
+    "arxiv",
+    "web_highwire",
+    "web_json_ld",
+    "web_dublin_core",
+    "web_open_graph",
+    "web_doi_scan",
+    "ai",
+)
 
 # Fields without which a record must never be created automatically.
 CRITICAL_FIELDS = ("title", "authors", "year")
@@ -326,9 +338,13 @@ def merge_records(
                 )
             )
 
-    # 6. confidence: conflicts, AI-sourced facts, or missing critical
-    #    fields all block automatic creation
+    # 6. confidence: conflicts, AI-sourced facts, missing critical
+    #    fields, or web-only evidence all block automatic creation
     has_ai = any(source == "ai" for source in provenance.values())
+    has_trusted_source = any(
+        source in ("crossref", "pubmed", "arxiv", "user")
+        for source in provenance.values()
+    )
     title = values.get("title")
     authors = values.get("authors")
     critical_ok = (
@@ -338,7 +354,14 @@ def merge_records(
         and values.get("year") is not None
     )
     confidence: Confidence = (
-        "high" if (not conflicts and critical_ok and not has_ai) else "needs_confirmation"
+        "high"
+        if (
+            not conflicts
+            and critical_ok
+            and not has_ai
+            and has_trusted_source
+        )
+        else "needs_confirmation"
     )
 
     return MetadataCandidate(
@@ -362,20 +385,17 @@ def _default_adapters() -> dict[str, Any]:
     }
 
 
-def resolve(
+def resolve_records(
     identifiers: Sequence[ParsedIdentifier],
     *,
     adapters: Mapping[str, Any] | None = None,
-    confirmed: Mapping[str, Any] | None = None,
-    ai: Mapping[str, Any] | None = None,
-) -> MetadataCandidate:
-    """Resolve identifiers through adapters and merge the results.
+) -> list[SourceRecord]:
+    """Query adapters and return raw source records in deterministic order.
 
     Identical ``(kind, value)`` pairs are queried once. An adapter that
     raises :class:`~paper_notes.adapters.AdapterError` is skipped (its
     identifiers simply contribute nothing); when no source responds at
-    all, :class:`ResolutionError` is raised. No AI service is ever
-    called — ``ai`` is plain input data passed to :func:`merge_records`.
+    all, :class:`ResolutionError` is raised.
     """
     adapter_map = adapters if adapters is not None else _default_adapters()
     records: list[SourceRecord] = []
@@ -399,4 +419,23 @@ def resolve(
         raise ResolutionError(
             "no metadata source responded for the given identifiers"
         )
+    return records
+
+
+def resolve(
+    identifiers: Sequence[ParsedIdentifier],
+    *,
+    adapters: Mapping[str, Any] | None = None,
+    confirmed: Mapping[str, Any] | None = None,
+    ai: Mapping[str, Any] | None = None,
+) -> MetadataCandidate:
+    """Resolve identifiers through adapters and merge the results.
+
+    Identical ``(kind, value)`` pairs are queried once. An adapter that
+    raises :class:`~paper_notes.adapters.AdapterError` is skipped (its
+    identifiers simply contribute nothing); when no source responds at
+    all, :class:`ResolutionError` is raised. No AI service is ever
+    called — ``ai`` is plain input data passed to :func:`merge_records`.
+    """
+    records = resolve_records(identifiers, adapters=adapters)
     return merge_records(records, confirmed=confirmed, ai=ai)

@@ -83,7 +83,8 @@ from .locking import (
     lock_path,
     release_lock,
 )
-from .metadata import ResolutionError, merge_records, resolve
+from .metadata import ResolutionError, merge_records, resolve, resolve_records
+from .web_capture import WebCaptureRequest
 from .models import Paper
 from .paths import is_valid_key, main_note, pdf_attachment
 from .pdf import PdfError, extract_pdf_identifiers, sha256_stream
@@ -374,6 +375,386 @@ def create_item(
             paper_id=str(paper.paper_id),
             path=str(main_note(root, key)),
             pdf_sha256=pdf_sha,
+        )
+    finally:
+        release_lock(lock)
+
+
+_WEB_CAPTURE_BIBLIOGRAPHIC_FIELDS = (
+    "item_type",
+    "title",
+    "authors",
+    "journal",
+    "journal_abbreviation",
+    "publication_date",
+    "year",
+    "volume",
+    "issue",
+    "pages",
+    "doi",
+    "pmid",
+    "pmcid",
+    "arxiv",
+    "url",
+    "issn",
+    "language",
+    "abstract",
+)
+
+
+def _web_critical_ok(values: Mapping[str, Any]) -> bool:
+    title = values.get("title")
+    authors = values.get("authors")
+    return (
+        title not in (None, "")
+        and isinstance(authors, list)
+        and len(authors) > 0
+        and values.get("year") is not None
+    )
+
+
+def _web_capture_token(
+    capture: WebCaptureRequest, action: str, target_fingerprint: str | None
+) -> str:
+    payload = {
+        "capture": capture.model_dump(mode="json"),
+        "action": action,
+        "target": target_fingerprint,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _verify_web_capture_token(
+    capture: WebCaptureRequest,
+    action: str,
+    target_fingerprint: str | None,
+    token: str | None,
+) -> None:
+    if token is None or not isinstance(token, str):
+        raise ItemConflict("missing web capture confirmation token")
+    expected = _web_capture_token(capture, action, target_fingerprint)
+    if token != expected:
+        raise ItemConflict(
+            "stale or mismatched web capture confirmation; nothing was written"
+        )
+
+
+def _web_update_patch(
+    existing: Paper, values: Mapping[str, Any]
+) -> dict[str, Any]:
+    patch: dict[str, Any] = {}
+    for field in _WEB_CAPTURE_BIBLIOGRAPHIC_FIELDS:
+        if field not in values:
+            continue
+        new_value = values[field]
+        old_value = getattr(existing, field, None)
+        if field == "authors":
+            old_list = (
+                [author.model_dump(exclude_none=True) for author in old_value]
+                if old_value
+                else []
+            )
+            new_list = list(new_value)
+            if new_list != old_list:
+                patch[field] = new_value
+        elif field == "issn":
+            old_list = list(old_value or [])
+            new_list = list(new_value)
+            if new_list != old_list:
+                patch[field] = new_value
+        else:
+            if new_value != old_value:
+                patch[field] = new_value
+    return patch
+
+
+def _apply_web_update_locked(
+    root: Path,
+    record: PaperRecord,
+    patch: Mapping[str, Any],
+    candidate: Any,
+    index: RepositoryIndex,
+    hook: Callable[[], None],
+    now_iso: str,
+) -> UpdateResult:
+    note = record.path
+    try:
+        _, doc = load_paper_note(note)
+    except (FrontmatterError, ValidationError) as exc:
+        raise ItemError(f"item {record.paper.citation_key!r} is no longer readable: {exc}") from exc
+
+    for field_name, value in patch.items():
+        doc.frontmatter[field_name] = value
+
+    if any(field in patch for field in _STRONG_FIELD_NAMES):
+        wanted = _canonicalize_patched_strong_fields(doc.frontmatter, patch)
+        self_id = record.paper.paper_id
+        for other_key in sorted(index.by_key):
+            other = index.by_key[other_key]
+            if other.paper.paper_id == self_id:
+                continue
+            if wanted & _paper_strong_ids(other.paper):
+                raise ItemConflict(
+                    "updated strong identifier is already owned by a "
+                    "different item; strong identifiers are unique "
+                    "across the repository"
+                )
+
+    # Keep derived provenance up to date without exposing it as an
+    # editable review field.
+    old_sources = set(record.paper.metadata_sources or [])
+    new_sources = set(candidate.field_provenance.values())
+    doc.frontmatter["metadata_sources"] = sorted(old_sources | new_sources)
+    provenance = dict(record.paper.field_provenance or {})
+    for field in patch:
+        if field in candidate.field_provenance:
+            provenance[field] = candidate.field_provenance[field]
+    doc.frontmatter["field_provenance"] = provenance
+    doc.frontmatter["updated_at"] = now_iso
+
+    try:
+        validated = Paper(**dict(doc.frontmatter))
+    except ValidationError as exc:
+        raise ItemError(
+            f"invalid updated metadata: {_validation_summary(exc)}"
+        ) from exc
+
+    op: fsops.StagedOperation | None = None
+    committed = False
+    try:
+        op = fsops.begin_operation(root, uuid.uuid4().hex)
+        fsops.stage_target(op, note)
+        fsops.write_target(
+            op, note, _serialize_content(doc.frontmatter, doc.body, doc.newline)
+        )
+        hook()
+        conflicts = fsops.commit(op)
+        committed = True
+        if conflicts:
+            raise ItemConflict(
+                "concurrent change detected while updating item: "
+                + _conflict_summary(conflicts)
+            )
+    except fsops.OperationConflict:
+        if op is not None and not committed:
+            fsops.rollback(op)
+        raise ItemConflict(
+            "concurrent change detected while updating item"
+        ) from None
+    except ItemError:
+        if op is not None and not committed:
+            fsops.rollback(op)
+        raise
+    except ItemConflict:
+        if op is not None and not committed:
+            fsops.rollback(op)
+        raise
+    except Exception:
+        if op is not None and not committed:
+            fsops.rollback(op)
+        raise ItemError("item update failed") from None
+    except BaseException:
+        if op is not None and not committed:
+            fsops.rollback(op)
+        raise
+
+    return UpdateResult(
+        status="updated",
+        citation_key=validated.citation_key,
+        path=str(note),
+        updated_fields=list(patch),
+        frontmatter=_json_safe(dict(doc.frontmatter)),
+    )
+
+
+def _commit_web_create_locked(
+    root: Path,
+    capture: WebCaptureRequest,
+    candidate: Any,
+    confirmed: Mapping[str, Any] | None,
+    index: RepositoryIndex,
+    hook: Callable[[], None],
+    now_iso: str,
+) -> CreateResult:
+    key = _choose_key(confirmed, candidate.values, index)
+    _preflight_create_target(root, key, index, False)
+    paper = _build_paper(candidate, key, None, now_iso)
+    _commit_new_item(root, key, paper, None, None, hook)
+    return CreateResult(
+        status="created",
+        action="created",
+        citation_key=key,
+        paper_id=str(paper.paper_id),
+        path=str(main_note(root, key)),
+        pdf_sha256=None,
+    )
+
+
+def create_item_from_web_capture(
+    vault_root: str | Path,
+    *,
+    capture: WebCaptureRequest,
+    confirmed: Mapping[str, Any] | None = None,
+    confirm_token: str | None = None,
+    adapters: Mapping[str, Any] | None = None,
+    rebuild_hook: Callable[[], None] | None = None,
+    now: datetime | None = None,
+) -> CreateResult:
+    """Create/review an item from a Browser Connector Web Capture.
+
+    Web evidence is never user-confirmed by default. Official adapters
+    are queried for every strong identifier in the capture; authoritative
+    values outrank web values through the shared metadata merge. Creation
+    is automatic only for a Verified Capture (strong ID + successful
+    official adapter + complete critical fields + no material conflict).
+    All other outcomes are `needs_confirmation` review plans; a confirmed
+    resubmission carries `confirmed` values plus the opaque
+    `confirm_token` returned by the plan.
+    """
+    root = Path(vault_root)
+    hook = rebuild_hook or _noop_rebuild
+    now_iso = (now if now is not None else datetime.now().astimezone()).isoformat()
+
+    if not isinstance(capture, WebCaptureRequest):
+        raise ItemError("web_capture must be a WebCaptureRequest")
+    if confirmed is not None and not isinstance(confirmed, Mapping):
+        raise ItemError("confirmed metadata must be a JSON object")
+    if confirmed is not None and confirm_token is None:
+        raise ItemError(
+            "web capture confirmation requires --confirm-token"
+        )
+
+    try:
+        web_records = capture.to_source_records()
+        ids = capture.strong_ids()
+    except ValueError as exc:
+        raise ItemError(str(exc)) from exc
+
+    official_records: list[Any] = []
+    if ids:
+        try:
+            official_records = resolve_records(ids, adapters=adapters)
+        except ResolutionError:
+            official_records = []
+
+    candidate = merge_records(
+        [*web_records, *official_records],
+        confirmed=confirmed,
+    )
+    candidate_ids = _strong_ids_from_values(candidate.values)
+    all_ids = _canonical_identifiers([*ids, *candidate_ids])
+
+    lock = _acquire(root, "create_item")
+    try:
+        index = build_index(root)
+        _assert_repository_consistent(index)
+        owners = _strong_owners(index, all_ids, None)
+        if owners:
+            if len(owners) > 1:
+                raise ItemConflict(
+                    "web capture identifiers resolve to multiple distinct "
+                    "items; refusing to pick one silently"
+                )
+            record = owners[0]
+            target_fingerprint = _file_sha256(record.path)
+            patch = _web_update_patch(record.paper, candidate.values)
+            if not patch:
+                return CreateResult(
+                    status="attached",
+                    action="duplicate_exists",
+                    citation_key=record.paper.citation_key,
+                    paper_id=str(record.paper.paper_id),
+                    path=str(record.path),
+                    pdf_sha256=None,
+                )
+            if confirm_token is None:
+                return _needs_confirmation(
+                    token=_web_capture_token(
+                        capture, "update_existing", target_fingerprint
+                    ),
+                    plan={
+                        "action": "update_existing",
+                        "citation_key": record.paper.citation_key,
+                        "paper_id": str(record.paper.paper_id),
+                        "path": str(record.path),
+                        "proposed_values": _json_safe(patch),
+                        "conflicts": [
+                            {"field": c.field, "values": [list(p) for p in c.values]}
+                            for c in candidate.conflicts
+                        ],
+                        "message": "web capture proposes metadata updates for an existing item",
+                    },
+                    candidates=[],
+                    action="update_existing",
+                )
+            _verify_web_capture_token(
+                capture, "update_existing", target_fingerprint, confirm_token
+            )
+            if not patch:
+                return CreateResult(
+                    status="attached",
+                    action="duplicate_exists",
+                    citation_key=record.paper.citation_key,
+                    paper_id=str(record.paper.paper_id),
+                    path=str(record.path),
+                    pdf_sha256=None,
+                )
+            result = _apply_web_update_locked(
+                root, record, patch, candidate, index, hook, now_iso
+            )
+            return CreateResult(
+                status="attached",
+                action="updated_metadata",
+                citation_key=result.citation_key,
+                paper_id=str(record.paper.paper_id),
+                path=str(record.path),
+                pdf_sha256=None,
+            )
+
+        fuzzy = _fuzzy_candidates(candidate.values, index)
+        if fuzzy:
+            return _needs_confirmation(
+                token=_web_capture_token(capture, "create", None),
+                plan={
+                    "action": "confirm_candidates",
+                    "message": "possible duplicate requires confirmation; "
+                    "never merged automatically",
+                },
+                candidates=fuzzy,
+                action="confirm_candidates",
+            )
+
+        if confirm_token is not None:
+            _verify_web_capture_token(capture, "create", None, confirm_token)
+            if not _web_critical_ok(candidate.values):
+                raise ItemConflict(
+                    "confirmed web capture is missing critical fields; "
+                    "nothing was written"
+                )
+            return _commit_web_create_locked(
+                root, capture, candidate, confirmed, index, hook, now_iso
+            )
+
+        if candidate.confidence == "high":
+            return _commit_web_create_locked(
+                root, capture, candidate, confirmed, index, hook, now_iso
+            )
+
+        return _needs_confirmation(
+            token=_web_capture_token(capture, "create", None),
+            plan={
+                "action": "create_with_confirmation",
+                "values": _json_safe(candidate.values),
+                "conflicts": [
+                    {"field": c.field, "values": [list(p) for p in c.values]}
+                    for c in candidate.conflicts
+                ],
+                "message": "web capture requires review before creation",
+            },
+            candidates=[],
+            action="confirm_candidates",
         )
     finally:
         release_lock(lock)
