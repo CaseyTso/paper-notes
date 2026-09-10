@@ -12,6 +12,7 @@ needs_confirmation, and failure.
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1483,6 +1484,366 @@ class AcceptanceRound3CreateTest(unittest.TestCase):
             hook.assert_not_called()
             self.assertEqual(count_paper_dirs(vault), 1)
             self.assertFalse((vault / ".paper-notes" / "write.lock").exists())
+
+
+def _vault_manifest(root):
+    entries = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d != ".paper-notes")
+        for d in sorted(dirnames):
+            p = Path(dirpath) / d
+            st = p.lstat()
+            if stat.S_ISLNK(st.st_mode):
+                entries[str(p.relative_to(root))] = ("symlink", os.readlink(p), None)
+            else:
+                entries[str(p.relative_to(root))] = (
+                    "dir",
+                    None,
+                    stat.S_IMODE(st.st_mode),
+                )
+        for f in sorted(filenames):
+            p = Path(dirpath) / f
+            st = p.lstat()
+            if stat.S_ISLNK(st.st_mode):
+                entries[str(p.relative_to(root))] = ("symlink", os.readlink(p), None)
+            else:
+                entries[str(p.relative_to(root))] = (
+                    "file",
+                    hashlib.sha256(p.read_bytes()).hexdigest(),
+                    stat.S_IMODE(st.st_mode),
+                )
+    return dict(sorted(entries.items()))
+
+
+def _manifest_diff(before, after):
+    added = sorted(p for p in after if p not in before)
+    removed = sorted(p for p in before if p not in after)
+    changed = sorted(p for p in before if p in after and before[p] != after[p])
+    return added, removed, changed
+
+
+class TestItemCreateConfirmation(unittest.TestCase):
+    """Phase C2 confirmation write, token validation, and fuzzy escape hatch tests."""
+
+    def test_fuzzy_escape_hatch_solves_deadlock(self):
+        with tempfile.TemporaryDirectory() as td:
+            vault = Path(td)
+            write_paper(
+                vault,
+                "smith2024",
+                title="Quantum Computing in Biology",
+                authors=[{"family": "Smith", "given": "John"}],
+                year=2024,
+                publication_date="2024-01-01",
+            )
+            self.assertEqual(count_paper_dirs(vault), 1)
+
+            incoming = {
+                "title": "Machine Learning in Astronomy",
+                "authors": [{"family": "Smith", "given": "John"}],
+                "year": 2024,
+            }
+
+            # Preview returns needs_confirmation with fuzzy candidates and confirmation token
+            preview = items.preview_create(vault, confirmed=incoming)
+            self.assertEqual(preview.status, "needs_confirmation")
+            self.assertEqual(preview.action, "confirm_candidates")
+            self.assertTrue(preview.confirmation_token)
+            self.assertEqual(len(preview.candidates), 1)
+            self.assertEqual(preview.candidates[0]["citation_key"], "smith2024")
+            self.assertEqual(count_paper_dirs(vault), 1)
+
+            # Unconfirmed retry: calling create_item with confirmed metadata but WITHOUT token
+            # still returns needs_confirmation (anti-accidental-merge guard maintained)
+            hook = mock.Mock()
+            unconfirmed = items.create_item(vault, confirmed=incoming, rebuild_hook=hook)
+            self.assertEqual(unconfirmed.status, "needs_confirmation")
+            self.assertEqual(unconfirmed.action, "confirm_candidates")
+            self.assertEqual(count_paper_dirs(vault), 1)
+            hook.assert_not_called()
+
+            # Confirmed execution with the preview token: creates the second paper (escape hatch!)
+            hook = mock.Mock()
+            result = items.create_item(
+                vault,
+                confirmed=incoming,
+                confirm_token=preview.confirmation_token,
+                rebuild_hook=hook,
+            )
+            self.assertEqual(result.status, "created")
+            self.assertEqual(result.action, "created")
+            self.assertTrue(result.citation_key)
+            self.assertNotEqual(result.citation_key, "smith2024")
+            self.assertEqual(count_paper_dirs(vault), 2)
+            self.assertEqual(len(result.candidates), 1)
+            self.assertEqual(result.candidates[0]["citation_key"], "smith2024")
+            hook.assert_called_once()
+
+            # The new note actually exists on disk with correct frontmatter
+            note_path = Path(result.path)
+            self.assertTrue(note_path.is_file())
+            from paper_notes.frontmatter import load_paper_note
+            paper, _ = load_paper_note(note_path)
+            self.assertEqual(paper.title, "Machine Learning in Astronomy")
+
+    def test_fuzzy_token_mismatch_and_stale_detection(self):
+        with tempfile.TemporaryDirectory() as td:
+            vault = Path(td)
+            write_paper(
+                vault,
+                "smith2024",
+                title="Quantum Computing in Biology",
+                authors=[{"family": "Smith", "given": "John"}],
+                year=2024,
+                publication_date="2024-01-01",
+            )
+            incoming = {
+                "title": "Machine Learning in Astronomy",
+                "authors": [{"family": "Smith", "given": "John"}],
+                "year": 2024,
+            }
+            preview = items.preview_create(vault, confirmed=incoming)
+            token = preview.confirmation_token
+
+            # 1. Bogus token raises ItemConflict and makes ZERO writes
+            manifest_before = _vault_manifest(vault)
+            hook = mock.Mock()
+            with self.assertRaises(items.ItemConflict):
+                items.create_item(
+                    vault,
+                    confirmed=incoming,
+                    confirm_token="bogus_token_12345",
+                    rebuild_hook=hook,
+                )
+            hook.assert_not_called()
+            manifest_after = _vault_manifest(vault)
+            self.assertEqual(_manifest_diff(manifest_before, manifest_after), ([], [], []))
+
+            # 2. Existing candidate note modified before confirm makes token stale -> ItemConflict
+            note_file = vault / "05 Literature" / "smith2024" / "smith2024.md"
+            note_file.write_text(note_file.read_text(encoding="utf-8") + "\n<!-- edit -->", encoding="utf-8")
+            manifest_before = _vault_manifest(vault)
+            hook = mock.Mock()
+            with self.assertRaises(items.ItemConflict):
+                items.create_item(
+                    vault,
+                    confirmed=incoming,
+                    confirm_token=token,
+                    rebuild_hook=hook,
+                )
+            hook.assert_not_called()
+            manifest_after = _vault_manifest(vault)
+            self.assertEqual(_manifest_diff(manifest_before, manifest_after), ([], [], []))
+
+    def test_token_validation_on_normal_create(self):
+        with tempfile.TemporaryDirectory() as td:
+            vault = Path(td)
+            confirmed = {
+                "title": "A Brand New Unique Paper",
+                "authors": [{"family": "UniqueAuthor", "given": "Alice"}],
+                "year": 2025,
+            }
+            preview = items.preview_create(vault, confirmed=confirmed)
+            self.assertEqual(preview.status, "needs_confirmation")
+            self.assertEqual(preview.action, "create")
+            token = preview.confirmation_token
+            self.assertTrue(token)
+
+            # 1. Bogus token raises ItemConflict and zero writes
+            manifest_before = _vault_manifest(vault)
+            hook = mock.Mock()
+            with self.assertRaises(items.ItemConflict):
+                items.create_item(
+                    vault,
+                    confirmed=confirmed,
+                    confirm_token="bogus-token-value",
+                    rebuild_hook=hook,
+                )
+            hook.assert_not_called()
+            manifest_after = _vault_manifest(vault)
+            self.assertEqual(_manifest_diff(manifest_before, manifest_after), ([], [], []))
+
+            # 2. Target occupied before confirmation -> ItemConflict and zero writes
+            key = preview.citation_key
+            target_note = vault / "05 Literature" / key / f"{key}.md"
+            target_note.parent.mkdir(parents=True, exist_ok=True)
+            target_note.write_text("occupied", encoding="utf-8")
+            hook = mock.Mock()
+            with self.assertRaises(items.ItemConflict):
+                items.create_item(
+                    vault,
+                    confirmed=confirmed,
+                    confirm_token=token,
+                    rebuild_hook=hook,
+                )
+            hook.assert_not_called()
+
+            # Clean up occupied file for next step
+            target_note.unlink()
+            target_note.parent.rmdir()
+
+            # 3. Valid token succeeds
+            hook = mock.Mock()
+            result = items.create_item(
+                vault,
+                confirmed=confirmed,
+                confirm_token=token,
+                rebuild_hook=hook,
+            )
+            self.assertEqual(result.status, "created")
+            self.assertEqual(result.action, "created")
+            self.assertEqual(result.citation_key, key)
+            hook.assert_called_once()
+            self.assertEqual(count_paper_dirs(vault), 1)
+
+    def test_duplicate_exists_confirmation_token_validation(self):
+        with tempfile.TemporaryDirectory() as td:
+            vault = Path(td)
+            write_paper(vault, "existingPaper", doi=DOI)
+            self.assertEqual(count_paper_dirs(vault), 1)
+
+            preview = items.preview_create(
+                vault,
+                identifiers=[ident("doi", DOI)],
+            )
+            self.assertEqual(preview.status, "needs_confirmation")
+            self.assertEqual(preview.action, "duplicate_exists")
+            token = preview.confirmation_token
+
+            # Bogus token raises ItemConflict and makes zero writes
+            manifest_before = _vault_manifest(vault)
+            hook = mock.Mock()
+            with self.assertRaises(items.ItemConflict):
+                items.create_item(
+                    vault,
+                    identifiers=[ident("doi", DOI)],
+                    confirm_token="bogus-duplicate-token",
+                    rebuild_hook=hook,
+                )
+            hook.assert_not_called()
+            manifest_after = _vault_manifest(vault)
+            self.assertEqual(_manifest_diff(manifest_before, manifest_after), ([], [], []))
+
+            # Valid token returns duplicate_exists with status="attached", zero writes, hook 0
+            hook = mock.Mock()
+            result = items.create_item(
+                vault,
+                identifiers=[ident("doi", DOI)],
+                confirm_token=token,
+                rebuild_hook=hook,
+            )
+            self.assertEqual(result.status, "attached")
+            self.assertEqual(result.action, "duplicate_exists")
+            hook.assert_not_called()
+            self.assertEqual(count_paper_dirs(vault), 1)
+
+    def test_backward_compatibility_without_token(self):
+        with tempfile.TemporaryDirectory() as td:
+            vault = Path(td)
+            adapter = FakeAdapter(CROSSREF_VALUES)
+            hook = mock.Mock()
+            # Explicitly omitting confirm_token (default None) creates item immediately
+            result = items.create_item(
+                vault,
+                identifiers=[ident("doi", DOI)],
+                adapters={"doi": adapter},
+                rebuild_hook=hook,
+            )
+            self.assertEqual(result.status, "created")
+            self.assertEqual(count_paper_dirs(vault), 1)
+            hook.assert_called_once()
+
+            # Second call without token detects duplicate immediately
+            hook.reset_mock()
+            second = items.create_item(
+                vault,
+                identifiers=[ident("doi", DOI)],
+                adapters={"doi": adapter},
+                rebuild_hook=hook,
+            )
+            self.assertEqual(second.status, "attached")
+            self.assertEqual(second.action, "duplicate_exists")
+            hook.assert_not_called()
+
+    def test_cli_fuzzy_escape_and_confirm_token_end_to_end(self):
+        with tempfile.TemporaryDirectory() as td:
+            vault = Path(td)
+            (vault / "05 Literature").mkdir(parents=True)
+            # Create paper 1 via CLI
+            conf1 = vault / "conf1.json"
+            conf1.write_text(
+                json.dumps({
+                    "title": "Quantum Computing in Biology",
+                    "authors": [{"family": "Smith", "given": "John"}],
+                    "year": 2024,
+                }),
+                encoding="utf-8",
+            )
+            res1 = subprocess.run(
+                [sys.executable, "-m", "paper_notes", "--json", "item", "create", "--vault", str(vault), "--confirmed", str(conf1)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            data1 = json.loads(res1.stdout)
+            self.assertEqual(data1["status"], "success")
+            self.assertEqual(data1["data"]["action"], "created")
+
+            # Paper 2: same author, same year, different title -> fuzzy candidate
+            conf2 = vault / "conf2.json"
+            conf2.write_text(
+                json.dumps({
+                    "title": "Machine Learning in Astronomy",
+                    "authors": [{"family": "Smith", "given": "John"}],
+                    "year": 2024,
+                }),
+                encoding="utf-8",
+            )
+
+            # Step 1: preview / initial create without confirm token returns needs_confirmation
+            res2 = subprocess.run(
+                [sys.executable, "-m", "paper_notes", "--json", "item", "create", "--vault", str(vault), "--confirmed", str(conf2)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res2.returncode, 0)
+            data2 = json.loads(res2.stdout)
+            self.assertEqual(data2["status"], "needs_confirmation")
+            self.assertEqual(data2["data"]["action"], "confirm_candidates")
+            token = data2["data"]["confirmation_token"]
+            self.assertTrue(token)
+            self.assertEqual(len(data2["data"]["candidates"]), 1)
+
+            # Step 2: bogus token fails with conflict (rc 3)
+            res_bogus = subprocess.run(
+                [sys.executable, "-m", "paper_notes", "--json", "item", "create", "--vault", str(vault), "--confirmed", str(conf2), "--confirm-token", "bogus-cli-token"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res_bogus.returncode, 3)
+            data_bogus = json.loads(res_bogus.stdout)
+            self.assertEqual(data_bogus["status"], "conflict")
+
+            # Step 3: dry-run combined with confirm-token fails with user error (rc 2)
+            res_dry_conflict = subprocess.run(
+                [sys.executable, "-m", "paper_notes", "--json", "item", "create", "--vault", str(vault), "--confirmed", str(conf2), "--dry-run", "--confirm-token", token],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res_dry_conflict.returncode, 2)
+
+            # Step 4: confirmed execution with valid token succeeds (rc 0), creating 2nd paper
+            res_confirmed = subprocess.run(
+                [sys.executable, "-m", "paper_notes", "--json", "item", "create", "--vault", str(vault), "--confirmed", str(conf2), "--confirm-token", token],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res_confirmed.returncode, 0)
+            data_confirmed = json.loads(res_confirmed.stdout)
+            self.assertEqual(data_confirmed["status"], "success")
+            self.assertEqual(data_confirmed["data"]["action"], "created")
+            self.assertIn("candidates", data_confirmed["data"])
+            self.assertEqual(count_paper_dirs(vault), 2)
 
 
 if __name__ == "__main__":

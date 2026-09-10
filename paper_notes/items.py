@@ -51,6 +51,7 @@ state); the CLI layer maps those onto protocol envelopes.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import io
 import json
 import re
@@ -96,6 +97,11 @@ _RT.width = 4096  # same line width as the frontmatter codec
 # Fuzzy similarity gate: a candidate at or above this score forces
 # needs_confirmation instead of automatic creation.
 _FUZZY_THRESHOLD = 0.5
+
+_STALE_TOKEN_MESSAGE = (
+    "confirmation token is stale: the vault or input changed since the preview; "
+    "re-run item create --dry-run"
+)
 
 # Identity fields are immutable through `item update`; only a dedicated
 # rename-key operation may change the citation key / aliases.
@@ -263,6 +269,7 @@ def create_item(
     adapters: Mapping[str, Any] | None = None,
     rebuild_hook: Callable[[], None] | None = None,
     now: datetime | None = None,
+    confirm_token: str | None = None,
 ) -> CreateResult:
     """Create a canonical item, or update/attach when an exact duplicate
     of a strong identifier or of the PDF hash already exists.
@@ -307,7 +314,9 @@ def create_item(
     # re-derived under the lock.
     pre_owners = _strong_owners(build_index(root), ids, pdf_sha)
     if pre_owners:
-        return _attach_duplicate(root, ids, pdf_sha, pdf, hook, now_iso)
+        return _attach_duplicate(
+            root, ids, pdf_sha, pdf, hook, now_iso, confirm_token=confirm_token
+        )
 
     # No owner was hit by the locally given identifiers/PDF hash, so the
     # candidate is resolved. Resolution only consults remote adapters
@@ -331,25 +340,93 @@ def create_item(
                     "strong identifiers and PDF hash resolve to multiple "
                     "distinct items; refusing to pick one silently"
                 )
-            return _attach_locked(root, owners[0], pdf, pdf_sha, hook, now_iso)
+            record = owners[0]
+            if confirm_token is not None:
+                expected = _item_action_token(
+                    action="duplicate_exists",
+                    ids=ids,
+                    pdf_sha=pdf_sha,
+                    key=record.paper.citation_key,
+                    owner_paper_id=str(record.paper.paper_id),
+                    target_note_state=_target_state(record.path),
+                    target_pdf_state=_target_state(
+                        pdf_attachment(root, record.paper.citation_key)
+                    ),
+                )
+                if not hmac.compare_digest(str(confirm_token), expected):
+                    raise ItemConflict(_STALE_TOKEN_MESSAGE)
+            return _attach_locked(root, record, pdf, pdf_sha, hook, now_iso)
 
         fuzzy = _fuzzy_candidates(candidate.values, index)
         if fuzzy:
-            return _needs_confirmation(
-                token=_confirmation_token(ids, pdf_sha, confirmed),
-                plan={
+            tentative_key = None
+            try:
+                tentative_key = _choose_key(confirmed, candidate.values, index)
+            except (ItemError, ItemConflict):
+                tentative_key = None
+            expected_token = _item_action_token(
+                action="confirm_candidates",
+                ids=ids,
+                pdf_sha=pdf_sha,
+                key=tentative_key,
+                target_note_state=_target_state(main_note(root, tentative_key))
+                if tentative_key
+                else None,
+                target_pdf_state=_target_state(pdf_attachment(root, tentative_key))
+                if tentative_key
+                else None,
+                candidate_states=_fuzzy_candidate_states(fuzzy, index),
+            )
+            if confirm_token is None:
+                plan: dict[str, Any] = {
                     "action": "confirm_candidates",
                     "message": "fuzzy duplicates require confirmation; "
                     "never auto-merged",
-                },
+                }
+                if tentative_key is not None:
+                    plan["citation_key"] = tentative_key
+                return _needs_confirmation(
+                    token=expected_token,
+                    plan=plan,
+                    candidates=fuzzy,
+                    action="confirm_candidates",
+                )
+            if not hmac.compare_digest(str(confirm_token), expected_token):
+                raise ItemConflict(_STALE_TOKEN_MESSAGE)
+            key = _choose_key(confirmed, candidate.values, index)
+            _preflight_create_target(root, key, index, pdf is not None)
+            paper = _build_paper(candidate, key, pdf_sha, now_iso)
+            _commit_new_item(root, key, paper, pdf, pdf_sha, hook)
+            return CreateResult(
+                status="created",
+                action="created",
+                citation_key=key,
+                paper_id=str(paper.paper_id),
+                path=str(main_note(root, key)),
+                pdf_sha256=pdf_sha,
                 candidates=fuzzy,
-                action="confirm_candidates",
             )
 
         if candidate.confidence == "needs_confirmation":
-            return _needs_confirmation(
-                token=_confirmation_token(ids, pdf_sha, confirmed),
-                plan={
+            tentative_key = None
+            try:
+                tentative_key = _choose_key(confirmed, candidate.values, index)
+            except (ItemError, ItemConflict):
+                tentative_key = None
+            expected_token = _item_action_token(
+                action="create_with_confirmation",
+                ids=ids,
+                pdf_sha=pdf_sha,
+                key=tentative_key,
+                target_note_state=_target_state(main_note(root, tentative_key))
+                if tentative_key
+                else None,
+                target_pdf_state=_target_state(pdf_attachment(root, tentative_key))
+                if tentative_key
+                else None,
+            )
+            if confirm_token is None:
+                cplan: dict[str, Any] = {
                     "action": "create_with_confirmation",
                     "values": _json_safe(candidate.values),
                     "conflicts": [
@@ -358,12 +435,43 @@ def create_item(
                     ],
                     "message": "missing critical fields, conflicting values, or "
                     "AI-suggested facts require confirmation",
-                },
+                }
+                if tentative_key is not None:
+                    cplan["citation_key"] = tentative_key
+                return _needs_confirmation(
+                    token=expected_token,
+                    plan=cplan,
+                    candidates=[],
+                    action="confirm_candidates",
+                )
+            if not hmac.compare_digest(str(confirm_token), expected_token):
+                raise ItemConflict(_STALE_TOKEN_MESSAGE)
+            key = _choose_key(confirmed, candidate.values, index)
+            _preflight_create_target(root, key, index, pdf is not None)
+            paper = _build_paper(candidate, key, pdf_sha, now_iso)
+            _commit_new_item(root, key, paper, pdf, pdf_sha, hook)
+            return CreateResult(
+                status="created",
+                action="created",
+                citation_key=key,
+                paper_id=str(paper.paper_id),
+                path=str(main_note(root, key)),
+                pdf_sha256=pdf_sha,
                 candidates=[],
-                action="confirm_candidates",
             )
 
         key = _choose_key(confirmed, candidate.values, index)
+        if confirm_token is not None:
+            expected_token = _item_action_token(
+                action="create",
+                ids=ids,
+                pdf_sha=pdf_sha,
+                key=key,
+                target_note_state=_target_state(main_note(root, key)),
+                target_pdf_state=_target_state(pdf_attachment(root, key)),
+            )
+            if not hmac.compare_digest(str(confirm_token), expected_token):
+                raise ItemConflict(_STALE_TOKEN_MESSAGE)
         _preflight_create_target(root, key, index, pdf is not None)
         paper = _build_paper(candidate, key, pdf_sha, now_iso)
 
@@ -378,6 +486,222 @@ def create_item(
         )
     finally:
         release_lock(lock)
+
+
+def preview_create(
+    vault_root: str | Path,
+    *,
+    identifiers: Sequence[ParsedIdentifier] = (),
+    pdf: str | Path | None = None,
+    confirmed: Mapping[str, Any] | None = None,
+    ai: Mapping[str, Any] | None = None,
+    adapters: Mapping[str, Any] | None = None,
+    rebuild_hook: Callable[[], None] | None = None,
+) -> CreateResult:
+    """Read-only dry-run preview of manual item creation.
+
+    No lock, zero writes, hook 0. Resolves remote metadata, parses local
+    PDF, verifies schema and targets, and returns a CreateResult with
+    status="needs_confirmation" containing the preview plan, candidates,
+    and confirmation token without mutating the vault.
+    """
+    root = Path(vault_root)
+
+    pdf_sha, pdf_identifiers = _ingest_pdf(pdf)
+    confirmed_ids = _validate_confirmed(confirmed, pdf is not None)
+    explicit_ids = _canonical_identifiers([*identifiers, *pdf_identifiers])
+    ids = _canonical_identifiers([*explicit_ids, *confirmed_ids])
+
+    index = build_index(root)
+    _assert_repository_consistent(index)
+
+    # 1. Fast-path check: an exact explicit strong identifier, confirmed
+    # strong identifier, or PDF hash already exists in the library.
+    pre_owners = _strong_owners(index, ids, pdf_sha)
+    if pre_owners:
+        if len(pre_owners) > 1:
+            raise ItemConflict(
+                "strong identifiers and PDF hash resolve to multiple "
+                "distinct items; refusing to pick one silently"
+            )
+        record = pre_owners[0]
+        key = record.paper.citation_key
+        return CreateResult(
+            status="needs_confirmation",
+            action="duplicate_exists",
+            citation_key=key,
+            paper_id=str(record.paper.paper_id),
+            path=str(record.path),
+            pdf_sha256=getattr(record.paper, "pdf_sha256", None),
+            confirmation_token=_item_action_token(
+                action="duplicate_exists",
+                ids=ids,
+                pdf_sha=pdf_sha,
+                key=key,
+                owner_paper_id=str(record.paper.paper_id),
+                target_note_state=_target_state(record.path),
+                target_pdf_state=_target_state(pdf_attachment(root, key)),
+            ),
+            plan={
+                "action": "duplicate_exists",
+                "citation_key": key,
+                "paper_id": str(record.paper.paper_id),
+                "path": str(record.path),
+                "message": f"item already exists in library with citation key {key!r}",
+            },
+            candidates=[],
+        )
+
+    # 2. Candidate resolution (remote adapters and/or confirmed metadata)
+    candidate = _resolve_candidate(
+        explicit_ids, confirmed, ai, adapters, pdf is not None
+    )
+    candidate_ids = _strong_ids_from_values(candidate.values)
+    all_ids = _canonical_identifiers([*ids, *candidate_ids])
+
+    # 3. Post-resolution check for strong owners hit by candidate cross-identifiers
+    owners = _strong_owners(index, all_ids, pdf_sha)
+    if owners:
+        if len(owners) > 1:
+            raise ItemConflict(
+                "strong identifiers and PDF hash resolve to multiple "
+                "distinct items; refusing to pick one silently"
+            )
+        record = owners[0]
+        key = record.paper.citation_key
+        return CreateResult(
+            status="needs_confirmation",
+            action="duplicate_exists",
+            citation_key=key,
+            paper_id=str(record.paper.paper_id),
+            path=str(record.path),
+            pdf_sha256=getattr(record.paper, "pdf_sha256", None),
+            confirmation_token=_item_action_token(
+                action="duplicate_exists",
+                ids=ids,
+                pdf_sha=pdf_sha,
+                key=key,
+                owner_paper_id=str(record.paper.paper_id),
+                target_note_state=_target_state(record.path),
+                target_pdf_state=_target_state(pdf_attachment(root, key)),
+            ),
+            plan={
+                "action": "duplicate_exists",
+                "citation_key": key,
+                "paper_id": str(record.paper.paper_id),
+                "path": str(record.path),
+                "values": _json_safe(candidate.values),
+                "message": f"item already exists in library with citation key {key!r}",
+            },
+            candidates=[],
+        )
+
+    # 4. Fuzzy duplicate check
+    fuzzy = _fuzzy_candidates(candidate.values, index)
+    if fuzzy:
+        tentative_key = None
+        try:
+            tentative_key = _choose_key(confirmed, candidate.values, index)
+        except (ItemError, ItemConflict):
+            tentative_key = None
+        plan: dict[str, Any] = {
+            "action": "confirm_candidates",
+            "values": _json_safe(candidate.values),
+            "conflicts": [
+                {"field": c.field, "values": [list(p) for p in c.values]}
+                for c in candidate.conflicts
+            ],
+            "message": "fuzzy duplicates require confirmation; never auto-merged",
+        }
+        if tentative_key is not None:
+            plan["citation_key"] = tentative_key
+        return CreateResult(
+            status="needs_confirmation",
+            action="confirm_candidates",
+            citation_key=tentative_key,
+            pdf_sha256=pdf_sha,
+            confirmation_token=_item_action_token(
+                action="confirm_candidates",
+                ids=ids,
+                pdf_sha=pdf_sha,
+                key=tentative_key,
+                target_note_state=_target_state(main_note(root, tentative_key))
+                if tentative_key
+                else None,
+                target_pdf_state=_target_state(pdf_attachment(root, tentative_key))
+                if tentative_key
+                else None,
+                candidate_states=_fuzzy_candidate_states(fuzzy, index),
+            ),
+            plan=plan,
+            candidates=fuzzy,
+        )
+
+    # 5. Metadata confidence check (missing critical fields, conflicts, etc.)
+    if candidate.confidence == "needs_confirmation":
+        tentative_key = None
+        try:
+            tentative_key = _choose_key(confirmed, candidate.values, index)
+        except (ItemError, ItemConflict):
+            tentative_key = None
+        plan = {
+            "action": "create_with_confirmation",
+            "values": _json_safe(candidate.values),
+            "conflicts": [
+                {"field": c.field, "values": [list(p) for p in c.values]}
+                for c in candidate.conflicts
+            ],
+            "message": "missing critical fields, conflicting values, or "
+            "AI-suggested facts require confirmation",
+        }
+        if tentative_key is not None:
+            plan["citation_key"] = tentative_key
+        return CreateResult(
+            status="needs_confirmation",
+            action="create_with_confirmation",
+            citation_key=tentative_key,
+            pdf_sha256=pdf_sha,
+            confirmation_token=_item_action_token(
+                action="create_with_confirmation",
+                ids=ids,
+                pdf_sha=pdf_sha,
+                key=tentative_key,
+                target_note_state=_target_state(main_note(root, tentative_key))
+                if tentative_key
+                else None,
+                target_pdf_state=_target_state(pdf_attachment(root, tentative_key))
+                if tentative_key
+                else None,
+            ),
+            plan=plan,
+            candidates=[],
+        )
+
+    # 6. High confidence: ready to create
+    key = _choose_key(confirmed, candidate.values, index)
+    _preflight_create_target(root, key, index, pdf is not None)
+    return CreateResult(
+        status="needs_confirmation",
+        action="create",
+        citation_key=key,
+        pdf_sha256=pdf_sha,
+        confirmation_token=_item_action_token(
+            action="create",
+            ids=ids,
+            pdf_sha=pdf_sha,
+            key=key,
+            target_note_state=_target_state(main_note(root, key)),
+            target_pdf_state=_target_state(pdf_attachment(root, key)),
+        ),
+        plan={
+            "action": "create",
+            "citation_key": key,
+            "values": _json_safe(candidate.values),
+            "conflicts": [],
+            "message": "metadata preview ready for creation",
+        },
+        candidates=[],
+    )
 
 
 _WEB_CAPTURE_BIBLIOGRAPHIC_FIELDS = (
@@ -1114,6 +1438,8 @@ def _attach_duplicate(
     pdf: str | Path | None,
     hook: Callable[[], None],
     now_iso: str,
+    *,
+    confirm_token: str | None = None,
 ) -> CreateResult:
     """Pre-lock entry point for an exact duplicate: re-derive the owner
     set under the lock and attach to it — never a second item."""
@@ -1131,7 +1457,22 @@ def _attach_duplicate(
             raise ItemConflict(
                 "the duplicate item disappeared while attaching; retry"
             )
-        return _attach_locked(root, owners[0], pdf, pdf_sha, hook, now_iso)
+        record = owners[0]
+        if confirm_token is not None:
+            expected = _item_action_token(
+                action="duplicate_exists",
+                ids=ids,
+                pdf_sha=pdf_sha,
+                key=record.paper.citation_key,
+                owner_paper_id=str(record.paper.paper_id),
+                target_note_state=_target_state(record.path),
+                target_pdf_state=_target_state(
+                    pdf_attachment(root, record.paper.citation_key)
+                ),
+            )
+            if not hmac.compare_digest(str(confirm_token), expected):
+                raise ItemConflict(_STALE_TOKEN_MESSAGE)
+        return _attach_locked(root, record, pdf, pdf_sha, hook, now_iso)
     finally:
         release_lock(lock)
 
@@ -1660,6 +2001,48 @@ def _confirmation_token(
         "identifiers": sorted((i.kind, i.value) for i in ids),
         "pdf_sha256": pdf_sha,
         "confirmed": _json_safe(dict(confirmed or {})),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _fuzzy_candidate_states(
+    candidates: Sequence[Mapping[str, Any]],
+    index: RepositoryIndex,
+) -> list[tuple[str, str, str | None]]:
+    states = []
+    for c in candidates:
+        ckey = str(c.get("citation_key") or "")
+        rec = index.by_key.get(ckey)
+        if rec is not None:
+            sha = _target_state(rec.path).get("sha256")
+            states.append((ckey, str(rec.paper.paper_id), sha))
+        else:
+            states.append((ckey, "", None))
+    return sorted(states)
+
+
+def _item_action_token(
+    *,
+    action: str,
+    ids: Sequence[ParsedIdentifier],
+    pdf_sha: str | None,
+    key: str | None = None,
+    owner_paper_id: str | None = None,
+    target_note_state: Mapping[str, Any] | None = None,
+    target_pdf_state: Mapping[str, Any] | None = None,
+    candidate_states: Sequence[Any] = (),
+) -> str:
+    payload = {
+        "action": action,
+        "identifiers": sorted({(i.kind, i.value) for i in ids}),
+        "pdf_sha256": pdf_sha,
+        "key": key,
+        "owner_paper_id": owner_paper_id,
+        "target_note_state": dict(target_note_state) if target_note_state is not None else None,
+        "target_pdf_state": dict(target_pdf_state) if target_pdf_state is not None else None,
+        "candidate_states": list(candidate_states),
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True).encode("utf-8")

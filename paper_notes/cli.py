@@ -115,6 +115,11 @@ def build_parser(json_mode: bool) -> _JsonAwareArgumentParser:
         "--confirm-token",
         help="opaque confirmation token from a Web Capture review plan",
     )
+    create_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="produce metadata preview and confirmation token without writing",
+    )
     create_parser.set_defaults(func=_cmd_item_create)
 
     show_parser = item_subparsers.add_parser(
@@ -1059,6 +1064,9 @@ def _cmd_item_create(args: argparse.Namespace) -> Envelope:
         else None
     )
 
+    if getattr(args, "dry_run", False) and args.web_capture:
+        raise UserError("--dry-run cannot be combined with --web-capture")
+
     if args.web_capture:
         if (
             args.doi
@@ -1089,16 +1097,31 @@ def _cmd_item_create(args: argparse.Namespace) -> Envelope:
             )
         )
     else:
-        identifiers = _parse_identifier_args(args)
-        pdf = Path(args.pdf) if args.pdf else None
-        result = _run_item(
-            lambda: items.create_item(
-                Path(args.vault),
-                identifiers=identifiers,
-                pdf=pdf,
-                confirmed=confirmed,
+        if getattr(args, "dry_run", False):
+            if args.confirm_token:
+                raise UserError("--dry-run cannot be combined with --confirm-token")
+            identifiers = _parse_identifier_args(args)
+            pdf = Path(args.pdf) if args.pdf else None
+            result = _run_item(
+                lambda: items.preview_create(
+                    Path(args.vault),
+                    identifiers=identifiers,
+                    pdf=pdf,
+                    confirmed=confirmed,
+                )
             )
-        )
+        else:
+            identifiers = _parse_identifier_args(args)
+            pdf = Path(args.pdf) if args.pdf else None
+            result = _run_item(
+                lambda: items.create_item(
+                    Path(args.vault),
+                    identifiers=identifiers,
+                    pdf=pdf,
+                    confirmed=confirmed,
+                    confirm_token=args.confirm_token,
+                )
+            )
     base = {
         "citation_key": result.citation_key,
         "paper_id": result.paper_id,
@@ -1106,16 +1129,28 @@ def _cmd_item_create(args: argparse.Namespace) -> Envelope:
         "pdf_sha256": result.pdf_sha256,
     }
     if result.status == "created":
-        return success({"action": "created", **base})
+        data = {"action": "created", **base}
+        if result.candidates:
+            data["candidates"] = result.candidates
+        return success(data)
     if result.status == "attached":
         return success({"action": result.action, **base})
-    return needs_confirmation(
-        {
-            "confirmation_token": result.confirmation_token,
-            "plan": result.plan,
-            "candidates": result.candidates,
-        }
-    )
+    data = {
+        "confirmation_token": result.confirmation_token,
+        "plan": result.plan,
+        "candidates": result.candidates,
+    }
+    if result.citation_key is not None:
+        data["citation_key"] = result.citation_key
+    if result.action is not None:
+        data["action"] = result.action
+    if result.paper_id is not None:
+        data["paper_id"] = result.paper_id
+    if result.path is not None:
+        data["path"] = result.path
+    if result.pdf_sha256 is not None:
+        data["pdf_sha256"] = result.pdf_sha256
+    return needs_confirmation(data)
 
 
 def _cmd_item_show(args: argparse.Namespace) -> Envelope:

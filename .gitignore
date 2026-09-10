@@ -27,3 +27,6 @@ images/
 # Local process logs — never commit
 PROGRESS.md
 BLOCKED.md
+
+# local backups (never commit)
+.bak*/
