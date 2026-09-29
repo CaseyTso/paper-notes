@@ -33,6 +33,15 @@ from the manifest (recorded by the CLI dry run) unless the caller
 passes ``vault_root`` explicitly. Backups, manifests, and journals live
 only under ``state_root/<run_id>/``; Zotero and the real vault are
 never touched except for the approved apply.
+
+Both ``apply_migration`` and ``rollback_migration`` are top-level
+managed vault mutations: the shared workspace write lock
+(``<vault>/.paper-notes/write.lock``, operation ``migrate``) is
+acquired after the vault root is resolved but before any vault or
+journal mutation, and released in ``finally``. A lock conflict raises
+:class:`MigrationConflict` with zero vault writes and zero journal
+writes; stale and low-level lock errors raise :class:`MigrationError`.
+``verify`` and the dry-run planner stay read-only and lock-free.
 """
 
 import hashlib
@@ -53,6 +62,13 @@ from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap
 
 from ..fsops import MoveTargetExists, NoReplaceMoveError, no_replace_move
+from ..locking import (
+    LockConflict,
+    LockError,
+    StaleLockError,
+    acquire_lock,
+    release_lock,
+)
 from ..models import Paper
 from ..paths import literature_root
 from .legacy import (
@@ -98,7 +114,22 @@ class MigrationError(Exception):
 
 
 class MigrationConflict(Exception):
-    """A conflicting vault state stops the migration without any write."""
+    """A conflicting vault state stops the migration.
+
+    Note that confirmation token / plan mismatches raise MigrationError
+    (not MigrationConflict), and concurrent writer conflicts raise
+    LockConflict.
+
+    During apply, conflict checks (occupied target, missing source directory,
+    changed source PDF, external edit during staging) occur post-lock, after
+    fresh journal creation in state_root and cleanup of any stale in-vault
+    staging directory. They abort before committing the conflicting item;
+    they do not guarantee zero prior vault writes if stale staging cleanup
+    or earlier item migrations already took place. During rollback, conflicts
+    detected post-mutation (target changed since apply, source reappeared,
+    restored directory occupied) leave already-applied state in place and
+    refuse to overwrite, with the journal as evidence.
+    """
 
     def __init__(self, message: str) -> None:
         super().__init__(message)
@@ -1240,6 +1271,49 @@ def _restore_item(jitem: dict[str, Any], vault: Path, state_root: Path, run_id: 
     jitem["rolled_back"] = True
 
 
+def _acquire(vault: Path):
+    """Acquire the shared workspace write lock (operation ``migrate``),
+    mapping lock failures onto the migration error hierarchy.
+
+    Conflicts raise :class:`MigrationConflict` (CLI rc 3) before any
+    vault or journal write; stale / low-level lock errors raise
+    :class:`MigrationError` (CLI rc 2).
+    """
+    try:
+        return acquire_lock(vault, "migrate")
+    except LockConflict as exc:
+        raise MigrationConflict(f"vault write lock held: {exc}") from exc
+    except StaleLockError as exc:
+        raise MigrationError(f"vault write lock stale: {exc}") from exc
+    except LockError as exc:
+        raise MigrationError(f"vault write lock error: {exc}") from exc
+
+
+def _release_or_domain_error(vault: Path, exc: LockError, action: str) -> MigrationError:
+    """Raise the user-facing release-failure error for a migration that
+    may have committed (apply) or restored (rollback) before the lock
+    release failed."""
+    raise MigrationError(
+        f"migration {action} finished but releasing the workspace write "
+        "lock failed: the operation may already be committed and a "
+        "write.lock residue may remain at "
+        f"{vault / '.paper-notes' / 'write.lock'}; inspect and resolve "
+        "the lock before retrying"
+    ) from exc
+
+
+def _release_or_raise_primary(lock, vault: Path, action: str) -> None:
+    """Release the migration lock, mapping release failure (no active
+    primary) onto :class:`MigrationError` with an explicit may-be-
+    committed / lock-residue message. With an active primary,
+    ``release_lock`` does not raise (it only attaches a note), so the
+    primary surfaces untouched."""
+    try:
+        release_lock(lock)
+    except LockError as exc:
+        raise _release_or_domain_error(vault, exc, action) from exc
+
+
 def apply_migration(
     run_id: str,
     confirm_token: str,
@@ -1255,7 +1329,26 @@ def apply_migration(
             f"confirmation token does not match the plan for run {run_id}"
         )
     vault = _resolve_vault(manifest, vault_root)
+    lock = _acquire(vault)
+    try:
+        result = _apply_migration_locked(run_id, confirm_token, vault, state_root, manifest)
+    except BaseException:
+        # release_lock never raises over an active primary (it only adds
+        # a note); surface the primary untouched.
+        release_lock(lock)
+        raise
+    _release_or_raise_primary(lock, vault, "apply")
+    return result
 
+
+def _apply_migration_locked(
+    run_id: str,
+    confirm_token: str,
+    vault: Path,
+    state_root: Path,
+    manifest: dict[str, Any],
+) -> ApplyResult:
+    """Apply body; caller holds the shared workspace write lock."""
     journal = _load_journal(state_root, run_id)
     was_applied = journal.get("status") == "applied"
     if not journal or journal.get("status") in ("rolled_back", "failed"):
@@ -1487,6 +1580,25 @@ def rollback_migration(
     state_root = Path(state_root) if state_root is not None else default_state_root()
     manifest = _load_manifest(state_root, run_id)
     vault = _resolve_vault(manifest, vault_root)
+    lock = _acquire(vault)
+    try:
+        result = _rollback_migration_locked(run_id, vault, state_root, manifest)
+    except BaseException:
+        # release_lock never raises over an active primary (it only adds
+        # a note); surface the primary untouched.
+        release_lock(lock)
+        raise
+    _release_or_raise_primary(lock, vault, "rollback")
+    return result
+
+
+def _rollback_migration_locked(
+    run_id: str,
+    vault: Path,
+    state_root: Path,
+    manifest: dict[str, Any],
+) -> RollbackResult:
+    """Rollback body; caller holds the shared workspace write lock."""
     journal = _load_journal(state_root, run_id)
     if not journal:
         raise MigrationError(

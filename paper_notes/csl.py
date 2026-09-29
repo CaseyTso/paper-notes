@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from .fsops import atomic_replace
+from .locking import LockConflict, LockError, StaleLockError, acquire_lock, release_lock
 from .models import Paper
 from .repository import InvalidRecord, RepositoryIndex, build_index
 
@@ -32,6 +33,21 @@ ALIASES_JSON = "citation-aliases.json"
 
 class PandocMissingError(Exception):
     """Pandoc is not installed; manuscript validation cannot run."""
+
+
+class IndexLockError(Exception):
+    """The shared workspace write lock failed while rebuilding indexes.
+
+    Raised for stale and low-level lock errors (user-facing error);
+    lock conflicts are raised as :class:`IndexConflict` instead.
+    """
+
+
+class IndexConflict(Exception):
+    """Another live process holds the shared workspace write lock.
+
+    Raised before any write: rebuilding indexes under contention is a
+    zero-write outcome (no temp file, no publication)."""
 
 
 class ManuscriptError(Exception):
@@ -153,14 +169,76 @@ def render_alias_map(index: RepositoryIndex) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
 
+def _acquire(vault_root: Path):
+    """Acquire the shared workspace write lock for a rebuild, mapping
+    lock failures onto the index error hierarchy."""
+    try:
+        return acquire_lock(vault_root, "rebuild_indexes")
+    except LockConflict as exc:
+        raise IndexConflict(f"vault write lock held: {exc}") from exc
+    except StaleLockError as exc:
+        raise IndexLockError(f"vault write lock stale: {exc}") from exc
+    except LockError as exc:
+        raise IndexLockError(f"vault write lock error: {exc}") from exc
+
+
 def rebuild_indexes(vault_root: Path) -> RebuildResult:
-    """Regenerate ``library.json`` and ``citation-aliases.json`` atomically."""
-    index = build_index(vault_root)
-    notes_dir = vault_root / PAPER_NOTES_DIR
-    library = notes_dir / LIBRARY_JSON
-    aliases = notes_dir / ALIASES_JSON
-    atomic_replace(library, render_library(index))
-    atomic_replace(aliases, render_alias_map(index))
+    """Regenerate ``library.json`` and ``citation-aliases.json``.
+
+    This is a public top-level managed vault mutation: the shared
+    workspace write lock (``<vault>/.paper-notes/write.lock``,
+    operation ``rebuild_indexes``) is acquired FIRST; the repository
+    observation (``build_index``), rendering, and both file
+    publications all happen inside the same lock, released in
+    ``finally``. Rebuilds are therefore serialized with respect to
+    every other managed writer (they all use the same single lock
+    file; the operation name is only lock metadata, not a separate
+    lock domain), and a lock conflict is a zero-write outcome
+    (:class:`IndexConflict`) — no observation, no temp, no publish.
+
+    Atomicity scope (Owner decision A): each pathname publication is
+    individually atomic (same-directory temp + ``os.replace``); the
+    two files are NOT published as a single kernel-atomic pair, and a
+    process crash between the two publications can leave a partial
+    (library-new / aliases-stale) state that the next rebuild repairs.
+    Internal callers that already hold the lock must not call this
+    public entrypoint again (no nested re-acquisition exists; if a
+    locked internal helper is ever needed, split a ``_rebuild_indexes
+    _locked`` out rather than re-acquiring here).
+
+    Release-failure semantics: if both files were published but
+    releasing the lock fails after retries, :class:`IndexLockError` is
+    raised stating that the rebuild may already be committed and a
+    write.lock residue may remain (inspect and resolve the lock before
+    retrying); if a primary exception is already in flight,
+    ``release_lock`` never replaces it (it only attaches a note).
+    """
+    lock = _acquire(vault_root)
+    try:
+        index = build_index(vault_root)
+        notes_dir = vault_root / PAPER_NOTES_DIR
+        library = notes_dir / LIBRARY_JSON
+        aliases = notes_dir / ALIASES_JSON
+        atomic_replace(library, render_library(index))
+        atomic_replace(aliases, render_alias_map(index))
+    except BaseException:
+        # release_lock never raises over an active primary (it only adds
+        # a note); surface the primary untouched.
+        release_lock(lock)
+        raise
+    try:
+        release_lock(lock)
+    except LockError as exc:
+        # The rebuild may already be committed and a write.lock residue
+        # may remain. Inspect and manually resolve the lock before any
+        # retry. Never claim a zero-write outcome here.
+        raise IndexLockError(
+            "rebuild_indexes finished but releasing the workspace write "
+            "lock failed: the rebuild may already be committed and a "
+            "write.lock residue may remain at "
+            f"{vault_root / PAPER_NOTES_DIR / 'write.lock'}; inspect and "
+            "resolve the lock before retrying"
+        ) from exc
     return RebuildResult(
         library_path=library,
         aliases_path=aliases,

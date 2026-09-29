@@ -8,6 +8,14 @@ license: MIT
 
 Obsidian-native 文献管理系统：以 vault 内 portable Markdown/YAML 与文件为持久资产，`paper-notes` CLI 是唯一受管写入者，Hermesian/本 skill 负责 MinerU 转换与 Figure 解读生成。**不再要求 Zotero 运行时**：过渡期 Zotero 仅作只读来源，迁移后新文献完全不经 Zotero；任何笔记都不写 active `zotero://` 链接（旧链接由 migration 移除）。
 
+## 受管 writer 共享锁契约（cooperative/managed writer）
+
+- **单一锁域**：CLI 的全部 vault mutation（item/card/**moc create**/**index rebuild**/**migration apply/rollback**/mineru/delete）共用同一个 `<vault>/.paper-notes/write.lock`；锁 metadata 的 `operation` 字段只是记账，**不是**独立锁域——任意两个受管操作互斥。
+- **advisory**：该锁是协作约定，不阻止不检查锁的外部脚本、编辑器或已打开 writable `MAP_SHARED` mmap；它们在一致性保证范围之外。
+- **atomic 的含义**：仅指单 pathname 的 rename/replace publish；source+card 是 P0–P3 协作事务，不是内核多文件事务。
+- **插件/调用者职责**（exact card create 前）：save-await（等磁盘写入完成）→ 基于已保存 bytes 重算 UTF-8 offset → CLI 期间冻结该 source 的编辑与保存交互 → 业务 mutation 全交 CLI → CLI 结束先 reload source/card 再解冻；异常路径 `finally` 解冻。
+- **失败语义分级**：pre-mutation 校验/锁冲突在明示的命令上零写入；exact anchor 失败是 success-with-warning（卡片已创建、无死链，仅 source 零写入）；migration 等在 mutation 后检测到的冲突可能已写 journal/执行恢复；运行失败可能留下明确报告的 partial/residue（不再宽泛承诺所有失败零半成品）。
+
 ## 前置条件
 
 - Python 3.11+ + `requests` + `PyMuPDF`（fitz，见 `requirements.txt`）
@@ -142,16 +150,17 @@ cd <paper-notes-repo> && python3 -m paper_notes.cli card create \
   --vault "<vault>" --key <citation_key> \
   --title "<结论性的一句话>" \
   --selection-file /tmp/selection.md \
-  [--filename card_Figure2_MyCard.md] \
-  --anchor-name fig2-interpretation --source-note "Figure解读_<citation_key>" \
-  [--backlink]
+  --source-note "Figure解读_<citation_key>" \
+  --source-start-byte <start_byte> --source-end-byte <end_byte> \
+  [--filename card_Figure2_MyCard.md]
 ```
 
-- `--selection-file`：选中内容的 verbatim Markdown（图片 embed、legend、四维解读原样）。
+- `--selection-file`：选中内容的 verbatim Markdown（图片 embed、legend、四维解读原样）。CLI 按 raw bytes 严格 UTF-8 读取，不进行 CRLF 归一化，与源笔记逐字节精确对齐。
 - 默认文件名 `card_<slug>.md`（slug 由 title 生成，保留中文）；`--filename` 可覆盖。
-- 提供 `--anchor-name` + `--source-note` 时：CLI 在源 Figure解读 笔记的选区末尾幂等插入 `^anchor`，并在卡片中生成 `> 参见 [[Figure解读_<key>#^anchor|...]]` 回链。
-- **双链铁律**：创建卡片默认加 `--backlink`——CLI 在源笔记 anchor 行之后插入 `> 卡片：[[<card>]]`，使 Figure解读 → 卡片 也可见地可跳转（加上卡片内的 `参见` 回链即构成显式双向链接；Obsidian 的 Backlinks 面板会自动追踪两侧）。回链幂等，已存在则 `card_warning`。
-- 目标卡片已存在 → `conflict`（退出码 3，零写入）；源笔记无法定位选区末尾 → `card_warning` 但卡片仍创建。
+- **推荐：Exact byte-range 模式（插件默认）**：成对传入 `--source-start-byte` 与 `--source-end-byte`（0-indexed UTF-8 字节半开区间 `[start, end)`），并指定规范 `--source-note "Figure解读_<key>"`。CLI 唯一定位选区所属 Markdown 顶层块，确定性生成 16-hex ASCII anchor（`^card-<hash>`）并幂等插入，卡片末尾自动包含单向回链 `> 参见 [[Figure解读_<key>#^<anchor>|...]]`。
+- **单向回链契约**：插件 exact 模式默认单向 card→source，**不向源笔记写 visible backlink**；exact 模式下传入 `--backlink` 或 `--anchor-name` 会被严格拒绝（rc 2）。旧手工 `--backlink`（在源笔记 anchor 行后插入 `> 卡片：[[<card>]]`）仍作为不带 byte offsets 的 legacy 模式显式可选兼容能力保留。
+- **Anchor 容错与无死链保证**：若源笔记被并发修改或外部编辑导致 byte 偏移不匹配，卡片仍然成功落盘创建（Envelope `status: "success"`，退出码 0），`anchor_link` 为 `null`（卡片内不留死链接），并返回稳定 warning（`code: "card_anchor_failed"`，指向相对源文件路径），警告信息中不泄露选区正文。
+- 目标卡片已存在 → `conflict`（退出码 3，零写入）。
 - 执行层薄封装见 `literature-card-from-figure-notes` skill；它负责读取选区、生成结论性标题，然后调用本 CLI。
 
 ## Library UX（Obsidian 插件交互）
@@ -243,8 +252,8 @@ python3 -m paper_notes.cli migrate rollback <run_id>
 | 迁移冲突（目标已有不同内容） | 停止交人工复核；绝不覆盖不同内容 |
 | YAML 非法 / 文件与元数据不一致 | 条目保持可见并给字段级诊断；`item reconcile` 提议修正；绝不静默覆盖人工编辑 |
 | `card create` 目标已存在 | `conflict`（退出码 3）零写入；换标题/文件名重跑 |
-| `card create` 源笔记定位失败 | `card_warning`：卡片已创建但 anchor 未插入，手动补 anchor 或去掉 `--anchor-name` |
-| `card create` 回链已存在 | `card_warning`：`> 卡片：[[...]]` 已在源笔记中，幂等 no-op |
+| `card create` 选区/Anchor 定位失败 | exact 模式返回 `card_anchor_failed` 警告（卡片已创建，`anchor_link: null`，无死链）；legacy 模式返回 `card_warning` |
+| `card create` legacy 回链已存在 | `card_warning`：`> 卡片：[[...]]` 已在源笔记中，幂等 no-op |
 
 ## 注意事项
 

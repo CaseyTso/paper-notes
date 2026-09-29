@@ -25,6 +25,7 @@ from . import (
     items,
     mineru,
     mocs,
+    paths,
 )
 from .identifiers import extract_identifiers, parse_arxiv, parse_doi, parse_pmcid, parse_pmid
 from .web_capture import WebCaptureRequest
@@ -452,6 +453,16 @@ def build_parser(json_mode: bool) -> _JsonAwareArgumentParser:
         help="insert '> 卡片：[[<card>]]' after the anchor in the source note "
         "(explicit bidirectional link)",
     )
+    card_create_parser.add_argument(
+        "--source-start-byte",
+        type=int,
+        help="start byte offset (0-indexed, half-open) in canonical Figure解读 note",
+    )
+    card_create_parser.add_argument(
+        "--source-end-byte",
+        type=int,
+        help="end byte offset (0-indexed, half-open) in canonical Figure解读 note",
+    )
     card_create_parser.set_defaults(func=_cmd_card_create)
 
     moc_parser = subparsers.add_parser(
@@ -519,7 +530,14 @@ def _cmd_index_root(args: argparse.Namespace) -> Envelope:
 
 
 def _cmd_index_rebuild(args: argparse.Namespace) -> Envelope:
-    result = csl.rebuild_indexes(Path(args.vault))
+    try:
+        result = csl.rebuild_indexes(Path(args.vault))
+    except csl.IndexLockError as exc:
+        # stale / low-level lock failure: user-facing error, rc 2
+        raise UserError(str(exc)) from exc
+    except csl.IndexConflict as exc:
+        # another live managed writer holds the shared lock: rc 3, zero writes
+        raise ConflictError(str(exc)) from exc
     warnings = [
         Issue(code=record.code, message=record.message, path=str(record.path))
         for record in result.invalid
@@ -842,14 +860,25 @@ def _cmd_card_root(args: argparse.Namespace) -> Envelope:
 
 
 def _cmd_card_create(args: argparse.Namespace) -> Envelope:
+    has_start = args.source_start_byte is not None
+    has_end = args.source_end_byte is not None
+    if (has_start or has_end) and args.backlink:
+        raise UserError("cannot use --backlink with exact byte offsets: exact mode does not write source backlinks")
+
     selection_path = Path(args.selection_file)
     try:
-        selection = selection_path.read_text(encoding="utf-8")
+        raw_bytes = selection_path.read_bytes()
     except OSError as exc:
-        raise UserError(f"cannot read selection file {selection_path}: {exc}") from exc
+        raise UserError(f"cannot read selection file {selection_path}: {exc.strerror or exc}") from exc
+    try:
+        selection = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise UserError(f"selection file {selection_path} is not valid UTF-8: byte {exc.start} ({exc.reason})") from exc
+
+    vault_path = Path(args.vault)
     result = _run_card(
         lambda: cards.create_card(
-            Path(args.vault),
+            vault_path,
             key=args.key,
             title=args.title,
             selection=selection,
@@ -857,18 +886,44 @@ def _cmd_card_create(args: argparse.Namespace) -> Envelope:
             anchor_name=args.anchor_name,
             source_note=args.source_note,
             backlink=args.backlink,
+            source_start_byte=args.source_start_byte,
+            source_end_byte=args.source_end_byte,
         )
     )
+
+    try:
+        rel_path = result.path.relative_to(vault_path)
+    except ValueError:
+        rel_path = result.path.resolve().relative_to(vault_path.resolve())
+
+    if rel_path.is_absolute():
+        raise RuntimeError(
+            f"invariant violation: card path {result.path} could not be relativized to vault {vault_path}"
+        )
+    posix_path = rel_path.as_posix()
+
     data = {
         "citation_key": result.citation_key,
         "paper_id": result.paper_id,
-        "path": str(result.path),
+        "path": posix_path,
+        "stem": result.card_stem,
         "anchor_name": result.anchor_name,
+        "anchor_status": result.anchor_status,
         "anchor_inserted": result.anchor_inserted,
         "anchor_link": result.anchor_link,
         "backlink_inserted": result.backlink_inserted,
     }
-    warnings = [Issue(code="card_warning", message=w) for w in result.warnings]
+
+    is_exact_mode = has_start and has_end
+    warnings: list[Issue] = []
+    if is_exact_mode and result.anchor_status == "failed":
+        rel_fig_path = f"{paths.LITERATURE_ROOT}/{result.citation_key}/Figure解读_{result.citation_key}.md"
+        for w in result.warnings:
+            warnings.append(Issue(code="card_anchor_failed", message=w, path=rel_fig_path))
+    else:
+        for w in result.warnings:
+            warnings.append(Issue(code="card_warning", message=w))
+
     return success(data, warnings=warnings)
 
 

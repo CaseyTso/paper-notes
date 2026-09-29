@@ -79,6 +79,7 @@ from .identifiers import (
 )
 from .locking import (
     LockConflict,
+    LockHandle,
     StaleLockError,
     acquire_lock,
     lock_path,
@@ -1254,7 +1255,7 @@ def update_item(
 # ---------------------------------------------------------------------------
 
 
-def _acquire(root: Path, operation: str) -> Path:
+def _acquire(root: Path, operation: str) -> LockHandle:
     """Acquire the workspace write lock, mapping lock failures onto the
     structured error hierarchy (spec §17.4, §17 error boundaries)."""
     try:
